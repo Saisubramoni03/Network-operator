@@ -1,0 +1,275 @@
+# Phase 2 — PySpark: Distributed Data Processing
+# Consolidated Notes: Workflow, Logic & Key Concepts
+
+
+## THE BIG PICTURE — WHY PHASE 2 EXISTS
+
+Phase 1 (pandas) proved the business logic works on ONE file. Phase 2's entire
+job is to make that same logic run correctly across MANY files at once
+(all 7 daily CSVs together), using Spark's distributed processing — without
+changing what the rules actually mean.
+
+CORE PIPELINE SHAPE (repeated across every lab):
+Raw CSVs → Rename to canonical → Clean/reject bad rows → Aggregate
+(country-code grain → grid/hour grain) → Enrich with geometry
+→ Tune performance → Write to disk → Wrap it all in one reusable job
+
+
+## SP1 — DISTRIBUTED INGESTION
+
+Goal: Load all 7 daily files as one Spark DataFrame, with a proper schema.
+
+Key logic:
+- Used spark.read.csv() with a MANUALLY DEFINED SCHEMA (StructType) instead of
+  inferSchema=True — faster, and fails loudly instead of silently guessing
+  wrong types.
+- Glob pattern "sms-call-internet-mi-*.csv" — NOT the looser
+  "sms-call-internet-*.csv", because the full dataset also has a different
+  city's (Trentino) files that would silently double-count if the pattern
+  were too loose.
+- Added input_file_name() column so every row can be traced back to its
+  source file.
+
+The bug we actually hit and fixed:
+The "datetime" column looked like epoch milliseconds in the trainer guide's
+assumption, but the real file had it as a plain string:
+"2013-11-01 00:00:00". Casting a string like that to LongType silently
+produces NULL (Spark doesn't error on failed casts by default) — the fix
+was using to_timestamp(col, "yyyy-MM-dd HH:mm:ss") instead of casting to a
+number.
+
+Acceptance check: distinct_hours == file_count × 24 (168 for 7 files).
+
+
+## SP2 — CLEANING & STANDARDIZATION
+
+Goal: Turn the raw DataFrame into a trusted one — same rules as NP2
+(pandas), now in Spark.
+
+Key logic — the "reject vs. handle" distinction (a recurring theme all
+through this project):
+- Missing grid_id / timestamp      -> REJECT (drop row) — can't assign to any grain
+- Negative activity value          -> REJECT (drop row) — impossible/invalid value
+- Blank (null) activity value      -> HANDLE (fill with 0) — means "no activity,"
+                                        not "bad data" — documented curated-layer rule
+
+Each of these three counts is logged SEPARATELY — never merged into one
+number — because auditors/downstream consumers need to know how much data
+was thrown away vs. how much was imputed.
+
+The required proof step: a PANDAS-VS-SPARK COMPARISON TEST — ran the exact
+same day's file through both the pandas UsageProcessor logic and the Spark
+logic, and asserted row counts and total_activity sums matched exactly.
+This exists because Spark's dropna/fillna/arithmetic can subtly differ
+from pandas' — and a "close but wrong" Spark pipeline wouldn't crash, it
+would just quietly produce different numbers.
+
+Gotcha: Spark's dayofweek() = 1(Sun)...7(Sat); pandas' dt.dayofweek =
+0(Mon)...6(Sun). Different conventions — not a bug, just don't compare
+them directly.
+
+
+## SP3 — NETWORK ACTIVITY AGGREGATIONS (THE GRAIN TRANSITION)
+
+Goal: Collapse many country-code rows into ONE row per grid per hour.
+
+Why this is called "the single most important validation point in the
+whole programme":
+The raw/canonical grain is timestamp + grid_id + country_code (many rows
+per grid/hour). Every downstream number — KPIs, ML features, API
+responses, dashboard charts — assumes one row per grid per hour. If this
+aggregation is subtly wrong (e.g., missing a groupBy key), you get
+duplicate rows at the wrong grain, which SILENTLY INFLATES every number
+downstream with no error anywhere.
+
+The logic:
+    hourly_grid_summary = clean_df.groupBy("grid_id","timestamp","date",
+                                            "hour","day_of_week")
+                                   .agg(sum of each activity column)
+
+country_code is deliberately dropped here — it does not belong past this
+point.
+
+Built-in hard assertions (not just eyeballed once):
+- Zero duplicates on (grid_id, timestamp) after aggregation
+- Output row count < input row count (proves aggregation actually reduced rows)
+- country_code absent from the result
+
+We hand-verified this with real numbers — summed the individual
+country-code rows for one grid/hour by hand and confirmed it matched the
+aggregated row exactly, column by column.
+
+
+## SP4 — GEOSPATIAL ENRICHMENT (JOINING ACTIVITY TO GEOGRAPHY)
+
+Goal: Attach real map geometry (from milano-grid.geojson) to each grid_id.
+
+The critical trap: every GeoJSON feature has TWO different IDs:
+- top-level "id"        -> 0-indexed (starts at 0)
+- properties.cellId     -> 1-indexed (starts at 1, matches grid_id's real range)
+
+Using the wrong one (id instead of cellId) produces a join that reports
+100% coverage and looks completely fine — but every single grid's
+activity would render on its NEIGHBOR's polygon on a map. Nothing errors,
+nothing crashes. THIS IS WHY A NUMERIC COVERAGE PERCENTAGE IS NOT
+SUFFICIENT PROOF THE JOIN IS CORRECT — we also had to spot-check real
+coordinates.
+
+The logic:
+1. Load GeoJSON with plain Python json (not Spark — file is small, only
+   10,000 features)
+2. Flatten properties.cellId -> grid_id + compute a CENTROID (average of
+   polygon corner points) for each grid
+3. LEFT JOIN (not inner) — a left join keeps every row and turns
+   non-matches into visible NULLs you can count; an inner join would
+   silently drop unmatched rows
+4. Originally used broadcast() since the lookup is tiny (10k rows vs
+   1.68M) — copies the small table to every worker, avoiding an expensive
+   shuffle. (Had to remove this on this machine due to a local environment
+   issue — see Environment Issues section below.)
+
+Validation — two layers, not just one:
+- NUMERIC: row count unchanged after join (proves no duplicate keys in the
+  lookup), 0 unmatched grids, 100% coverage
+- GEOGRAPHIC (the real proof): printed grid 1 and grid 2's actual
+  centroids and confirmed they're (a) inside Milan's real bounding box
+  (lon ~9.0–9.3, lat ~45.35–45.55), and (b) close to each other but NOT
+  identical — proving genuinely distinct, correctly-mapped adjacent cells.
+
+
+## SP5 — PERFORMANCE & EXECUTION BEHAVIOUR
+
+Goal: Learn to read EVIDENCE before optimizing — not apply every trick
+blindly.
+
+Four experiments, each teaching a different concept:
+
+1. explain() on the aggregation
+   -> Showed Spark's physical plan — filter pushdown to the CSV scan
+      itself, partial-then-final HashAggregate pattern, the shuffle
+      (Exchange) step.
+   -> Educational — confirms Spark is already doing sensible things
+      automatically.
+
+2. Cache a reused DataFrame
+   -> Without cache: ~11–13s every repeated .count(). With cache: first
+      call slower (~22s, builds the cache), then 0.3s on repeats — 30x+
+      faster.
+   -> ACCEPTED — but noted memory spillover to disk on this machine (logs
+      showed "Not enough space to cache in memory").
+
+3. Repartition by "date" vs. force 200 partitions
+   -> By-date: 7 partitions, 2.97s. Forced 200: 5.30s — SLOWER, not
+      faster.
+   -> REJECTED the 200-partition idea — on local[2] (only 2 real
+      workers), more partitions than workers just adds coordination
+      overhead with no parallel gain.
+
+4. Column pruning before groupBy
+   -> Full columns: 2.51s. Pruned to only needed columns: 2.19s.
+   -> ACCEPTED as a cheap habit — less data through the shuffle.
+
+The real lesson: caching helped a lot, over-partitioning on a small local
+setup actively hurt — proving "more partitions/more parallelism" is not
+automatically better. Evidence beats folklore.
+
+
+## SP6 — WRITE PROCESSED & ANALYTICS DATA
+
+Goal: Persist Spark's output in the right format for each use case — not
+just print results in a notebook.
+
+Three outputs, three different reasons:
+
+1. Cleaned activity -> PARQUET, partitioned by date
+   Columnar + compressed — far more efficient for analytics; partitioning
+   lets later queries skip irrelevant date folders entirely.
+
+2. hourly_grid_summary -> PARQUET, no geometry column
+   Geometry belongs in the static reference layer (10k rows), not
+   duplicated into every one of 1.68M fact rows — this is the
+   fact-vs-dimension design principle that Phase 3's warehouse modeling
+   will formalize.
+
+3. Dashboard summary -> CSV, single file (coalesce(1))
+   Tiny, human-readable summary meant for quick inspection (e.g. opening
+   in Excel) — CSV is the right tool here, for the opposite reason
+   Parquet was right above.
+
+Required round-trip validation: read the Parquet back and re-check row
+counts, schema, and the zero-duplicates assertion STILL HOLD after a
+write+read cycle — proving the write itself didn't subtly corrupt
+anything.
+
+Real measured result: raw CSVs = 631.6 MB -> Parquet = 165.1 MB (26% of
+original size) — the concrete, measured payoff of columnar storage +
+compression, not just a theoretical claim.
+
+
+## SP7 — BUILD THE REUSABLE SPARK ETL JOB
+
+Goal: Turn SP1–SP6 into ONE production-style script — telecom_pipeline.py
+— with proper functions, configuration, logging, and fail-fast behavior.
+
+The five functions (single responsibility each, same principle as NP2's
+pandas class):
+- read_raw()      -> load + rename to canonical, fail loudly if no files found
+- clean()         -> reject bad rows, null-to-zero rule, derive time features
+- aggregate()     -> THE grain transition (country_code -> grid/hour), with
+                     hard assertions
+- enrich()        -> join to geometry, validate (not written to disk —
+                     geometry stays separate)
+- write_outputs() -> Parquet + CSV writes, matching SP6's design
+- main()          -> wires it all together, structured logging, non-zero
+                     exit on failure
+
+Nothing hardcoded — --input-dir, --reference-dir, --output-dir are all
+command-line arguments, so the exact same script can run against any
+environment/folder without code changes.
+
+Fail-fast, proven with a real test: running against an empty folder
+produced a clear error message ("NO INPUT FILES FOUND...") AND exited
+with code 1 (confirmed via $LASTEXITCODE) — this matters because an
+orchestrator (coming in Phase 3) checks exit codes, not just log text, to
+detect failure.
+
+Final verification — every number matched every prior lab exactly:
+input_rows=15,089,165, rejected=0/0, nulls_handled=48,562,194,
+output_rows=1,679,994 — identical to SP2/SP3/SP6's independently-verified
+numbers. This proves the "refactor" genuinely reused the same logic
+rather than silently reimplementing it differently.
+
+
+## RECURRING THEMES ACROSS ALL OF PHASE 2
+
+1. Silent failures are the real danger, not crashes. A wrong grain, a
+   wrong identifier, a bad cast — none of these throw an error. They just
+   produce plausible-looking wrong numbers. Every lab's validation step
+   exists specifically to catch this class of bug.
+2. Reject vs. handle is a business decision, not a technical one —
+   missing keys and negative values are invalid (reject); blank activity
+   is meaningful (handle/zero-fill). Always logged as separate counts.
+3. Grain matters more than almost anything else. Getting groupBy right
+   (SP3) is the single highest-leverage correctness check in the whole
+   pipeline.
+4. Coverage % alone never proves a join is correct — always paired with a
+   real, spot-checkable fact (geographic coordinates, hand-summed
+   totals).
+5. Evidence over folklore for performance — measure before you optimize,
+   and be willing to reject a "best practice" that doesn't hold up on
+   your actual setup.
+
+
+## ENVIRONMENT ISSUES WE SOLVED (useful to remember for later phases)
+
+- Missing JAVA_HOME -> Spark can't reliably launch its internal
+  processes. Fixed by setting it explicitly (either system-wide or via
+  os.environ[...] at the top of each script).
+- Python 3.14 too new for PySpark -> created a dedicated virtual
+  environment (venv) running Python 3.11, kept separate from the main
+  system Python (Phase 1/pandas work is unaffected).
+- local[*] caused "Python worker failed to connect back" -> this
+  machine's antivirus/corporate security software likely throttles
+  simultaneous process creation. Fixed by using local[2] (or local[1])
+  instead — trades some speed for reliability, with zero effect on
+  correctness.
