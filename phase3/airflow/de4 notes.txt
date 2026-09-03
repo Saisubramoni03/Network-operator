@@ -1,0 +1,118 @@
+DE4 — Batch vs Streaming Decision Matrix
+
++----------------------------+--------------------------------------+-------------------------+----------------------+-------------------+--------------------------------------------------------------------------+
+| Scenario                   | Source                               | Arrival Pattern         | Required Latency     | Decision          | Reason                                                                   |
++----------------------------+--------------------------------------+-------------------------+----------------------+-------------------+--------------------------------------------------------------------------+
+| Daily usage summary        | Aggregated from daily                | Once per day            | 24 hours             | Batch             | Source only refreshes once per day, so streaming would not provide      |
+|                            | sms-call-internet-mi-*.csv files    | (new file daily)        |                      |                   | any meaningful freshness improvement.                                   |
++----------------------------+--------------------------------------+-------------------------+----------------------+-------------------+--------------------------------------------------------------------------+
+| Hypothetical live          | Per-event network activity           | Continuous,             | 1–10 seconds         | Streaming         | Genuine operational value requires near-real-time detection, such as   |
+| activity events            | (SMS/call/data session as it        | sub-second to seconds   |                      |                   | detecting a cell tower outage within seconds rather than hours.        |
+|                            | happens)                             |                         |                      |                   |                                                                          |
++----------------------------+--------------------------------------+-------------------------+----------------------+-------------------+--------------------------------------------------------------------------+
+| Billing report             | Aggregated usage over a billing      | Monthly                 | 24–48 hours          | Batch             | Billing cycles are periodic and there is no business need for           |
+|                            | cycle                                |                         |                      |                   | per-event billing updates.                                               |
++----------------------------+--------------------------------------+-------------------------+----------------------+-------------------+--------------------------------------------------------------------------+
+| Hotspot alerts             | Derived from hourly aggregated      | Hourly                  | 5–15 minutes         | Batch             | Source data only updates hourly. Streaming would add infrastructure     |
+|                            | grid activity                        |                         | after data lands     | (micro-batch)     | cost and complexity without making the source data more current.       |
++----------------------------+--------------------------------------+-------------------------+----------------------+-------------------+--------------------------------------------------------------------------+
+| Executive dashboard        | Aggregated KPIs across days/weeks    | Daily to weekly         | A few hours          | Batch             | Executives review trends rather than instantaneous changes, so          |
+| refresh                    |                                      | review cycle            |                      |                   | sub-minute freshness provides little additional value.                 |
++----------------------------+--------------------------------------+-------------------------+----------------------+-------------------+--------------------------------------------------------------------------+
+| Model training and         | Historical aggregated data           | Training: weekly/monthly| Training: hours      | Batch for both    | Model training is periodic and computationally heavy. Scoring only      |
+| scoring                    | (training), current hourly data     | retrain; scoring:       | Scoring: 5–15 minutes|                   | needs to keep pace with the hourly source data, so streaming is not    |
+|                            | (scoring)                            | hourly                  |                      |                   | required.                                                                |
++----------------------------+--------------------------------------+-------------------------+----------------------+-------------------+--------------------------------------------------------------------------+
+
+
+REQUIRED EXPLICIT JUSTIFICATIONS
+
+1. Batch, because streaming would add cost without adding value here
+
+Hotspot alerts are the clearest example.
+
+The source data itself only updates once per hour. Building a Kafka streaming
+pipeline to detect hotspots in real time would mean reacting to data that is,
+at best, an hour old anyway.
+
+Streaming infrastructure such as Kafka brokers, stream processors, and
+always-on compute would add operational cost and complexity. However, the
+alert cannot become more current than its hourly source data.
+
+Therefore, a batch or micro-batch process that runs once per hour, shortly
+after the file arrives, provides the same effective freshness with much less
+cost and complexity.
+
+
+2. Hypothetical streaming justification
+
+If the system evolves to ingest true per-event network signaling data instead
+of the current hourly aggregates, streaming would provide clear business
+value.
+
+For example, a cell tower failure or sudden traffic spike may need to be
+detected within seconds. Waiting for an hourly batch process could delay the
+response and increase customer impact.
+
+In that situation, the business requirement for rapid incident detection
+would require lower latency than the current data source can provide. This
+would be a strong reason to introduce Kafka and a streaming architecture.
+
+
+WHERE KAFKA COULD CONCEPTUALLY ENTER
+
+Kafka would sit between the raw event source and the rest of the architecture
+as a new ingestion layer:
+
+[Cell Towers Emit Raw Events]
+            |
+            v
+[Kafka Topic: raw_activity_events]
+            |
+            v
+[Stream Processor]
+(Near-Real-Time Micro-Aggregation)
+            |
+            v
+[Kafka-Backed Store / Data Store]
+            |
+            v
+[Existing Batch Pipeline]
+(Spark / Warehouse / Dashboards)
+
+
+The current CSV files would essentially be replaced by Kafka-backed event
+ingestion if this became a live production system.
+
+The existing downstream batch components, such as Spark processing,
+warehouse storage, and dashboards, would not necessarily need to change.
+The main change would be replacing the static CSV ingestion layer with a
+real-time event ingestion layer.
+
+
+REVISED ARCHITECTURE NOTE
+
+The streaming path is optional and conceptual only. It is not implemented
+in the current project.
+
+Nothing in Phase 2 or Phase 3 needs to change to support this future
+extension. Kafka is presented only as a possible future ingestion layer if
+the business later requires true real-time network event processing.
+
+
+DE4 ACCEPTANCE CRITERIA
+
+[✓] Every scenario has a specific latency number or range.
+
+[✓] At least one scenario explicitly explains that batch is preferred because
+    streaming would add cost and complexity without adding business value.
+
+[✓] Hotspot alerts are identified as the clearest batch/micro-batch example.
+
+[✓] A hypothetical streaming use case is included where seconds-level
+    latency provides genuine operational value.
+
+[✓] The Kafka streaming path is clearly marked as optional and conceptual,
+    not implemented.
+
+[✓] Current Phase 2/3 batch architecture remains unchanged.

@@ -98,3 +98,4 @@ empty_test_folder/
 sp4_output.txt
 sp5_output.txt
  
+phase3/warehouse/*.db

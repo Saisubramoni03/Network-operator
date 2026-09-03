@@ -64,7 +64,7 @@ def validate_schema(filepath):
 def validate_minimum_quality(filepath):
     """Check basic quality thresholds. Returns (is_valid, reason, row_count)."""
     try:
-        df = pd.read_csv(filepath)
+        df = pd.read_csv(filepath, on_bad_lines="skip", engine="python")
     except Exception as e:
         return False, f"FILE_UNREADABLE: {e}", 0
 
@@ -91,6 +91,37 @@ def validate_minimum_quality(filepath):
         return False, f"NEGATIVE_VALUES: {negative_counts}", row_count
 
     return True, None, row_count
+def validate_partial_corruption(filepath, threshold=0.05):
+    """Distinguishes 'a few garbage rows' from 'the whole file is
+    unusable'. Uses pandas' on_bad_lines='skip' to count rows that
+    couldn't be parsed at all (wrong field count, stray characters),
+    separate from the full-file validity checks above.
+
+    Returns (status, reason, good_row_count, bad_row_count) where
+    status is one of: "OK" (no corruption), "WARN" (tolerable,
+    below threshold), "REJECT" (too much corruption to trust)."""
+    try:
+        with open(filepath, "r") as f:
+            total_lines = sum(1 for _ in f) - 1  # minus header
+
+        good_df = pd.read_csv(filepath, on_bad_lines="skip", engine="python")
+        good_rows = len(good_df)
+        bad_rows = max(total_lines - good_rows, 0)
+
+        if bad_rows == 0:
+            return "OK", None, good_rows, 0
+
+        bad_ratio = bad_rows / total_lines if total_lines > 0 else 1.0
+
+        if bad_ratio <= threshold:
+            reason = f"PARTIAL_CORRUPTION_TOLERATED: {bad_rows} of {total_lines} rows skipped ({bad_ratio:.1%})"
+            return "WARN", reason, good_rows, bad_rows
+        else:
+            reason = f"PARTIAL_CORRUPTION_EXCEEDS_THRESHOLD: {bad_rows} of {total_lines} rows unparseable ({bad_ratio:.1%})"
+            return "REJECT", reason, good_rows, bad_rows
+
+    except Exception as e:
+        return "REJECT", f"FILE_UNREADABLE: {e}", 0, 0
 
 
 def route_file(filepath, filename, is_valid, raw_dir, rejected_dir):
@@ -153,7 +184,6 @@ def run_ingestion(landing_dir, raw_dir, rejected_dir, log_path):
             record = write_audit_record(log_path, filename, "REJECTED", None, schema_reason)
             results.append(record)
             continue
-
         quality_ok, quality_reason, row_count = validate_minimum_quality(filepath)
         if not quality_ok:
             dest = route_file(filepath, filename, False, raw_dir, rejected_dir)
@@ -162,9 +192,21 @@ def run_ingestion(landing_dir, raw_dir, rejected_dir, log_path):
             results.append(record)
             continue
 
+        # CONTROL #6: partial corruption check — tolerate a few bad
+        # rows, reject only if corruption exceeds the threshold
+        corruption_status, corruption_reason, good_rows, bad_rows = validate_partial_corruption(filepath)
+        if corruption_status == "REJECT":
+            dest = route_file(filepath, filename, False, raw_dir, rejected_dir)
+            logger.warning(f"REJECTED: {filename} -> {corruption_reason}")
+            record = write_audit_record(log_path, filename, "REJECTED", good_rows, corruption_reason)
+            results.append(record)
+            continue
+
         dest = route_file(filepath, filename, True, raw_dir, rejected_dir)
-        logger.info(f"ACCEPTED: {filename} -> {dest} ({row_count} rows)")
-        record = write_audit_record(log_path, filename, "ACCEPTED", row_count, None)
+        status_label = "ACCEPTED_WITH_WARNINGS" if corruption_status == "WARN" else "ACCEPTED"
+        log_reason = corruption_reason if corruption_status == "WARN" else None
+        logger.info(f"{status_label}: {filename} -> {dest} ({row_count} rows)")
+        record = write_audit_record(log_path, filename, status_label, row_count, log_reason)
         results.append(record)
 
     return results
