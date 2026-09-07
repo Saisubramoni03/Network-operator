@@ -50,6 +50,18 @@ CREATE TABLE fact_network_activity (
     internet_activity REAL,
     total_activity    REAL
 );
+
+CREATE TABLE IF NOT EXISTS grid_features (
+    grid_id           INTEGER NOT NULL REFERENCES dim_grid(grid_id),
+    feature_timestamp TEXT NOT NULL,
+    avg_activity      REAL,
+    activity_growth   REAL,
+    active_hours      INTEGER,
+    peak_ratio        REAL,
+    variability       REAL,
+    internet_share    REAL,
+    PRIMARY KEY (grid_id, feature_timestamp)
+);
 """
 
 INDEX_DDL = """

@@ -31,8 +31,16 @@ import logging
 import time
 from datetime import datetime
 
-os.environ["JAVA_HOME"] = r"C:\Program Files\Java\jdk-17"
-os.environ["PATH"] = os.environ["JAVA_HOME"] + r"\bin;" + os.environ["PATH"]
+import platform
+
+# Only override JAVA_HOME if it's not already set correctly by the environment
+if not os.environ.get("JAVA_HOME"):
+    if platform.system() == "Windows":
+        os.environ["JAVA_HOME"] = r"C:\Program Files\Java\jdk-17"
+        os.environ["PATH"] = os.environ["JAVA_HOME"] + r"\bin;" + os.environ["PATH"]
+    # On Linux/WSL, rely on JAVA_HOME already being set in the environment
+    # (e.g. via ~/.bashrc or the shell that launched this script)
+
 os.environ["PYSPARK_PYTHON"] = sys.executable
 os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 
