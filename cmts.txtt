@@ -1,0 +1,68 @@
+C:\Users\sai.subramoni\Downloads\Networkproject\phase4\api\run_server.bat
+
+cd ml
+C:\Users\sai.subramoni\Downloads\Networkproject\phase4\api\venv\Scripts\python.exe -m pip install scikit-learn
+C:\Users\sai.subramoni\Downloads\Networkproject\phase4\api\venv\Scripts\python.exe python anomaly_baseline.py
+
+
+C:\Users\sai.subramoni\Downloads\Networkproject\phase4\api\venv\Scripts\python.exe train_risk_model.py      
+
+
+npm install react-router-dom     
+
+npx create-react-app noc-dashboard                                        
+>> cd noc-dashboard                                                                                                                  
+
+npm install react-router-dom       
+
+
+
+python -c "import sqlite3; conn = sqlite3.connect('C:/Users/sai.subramoni/Downloads/Networkproject/phase3/warehouse/network_warehouse.db'); print(conn.execute(\"SELECT feature_timestamp, avg_activity, peak_ratio FROM grid_features WHERE grid_id=4821 ORDER BY feature_timestamp DESC LIMIT 1\").fetchone())"                                                                                                                                         
+
+
+
+python -c "import sqlite3; conn = sqlite3.connect('C:/Users/sai.subramoni/Downloads/Networkproject/phase3/warehouse/network_warehouse.db'); rows = conn.execute(\"SELECT t.timestamp, f.total_activity FROM fact_network_activity f JOIN dim_time t ON f.time_id=t.time_id WHERE f.grid_id=4821 ORDER BY t.timestamp DESC LIMIT 24\").fetchall(); vals = [r[1] for r in rows]; print('avg:', sum(vals)/len(vals)); print('max:', max(vals)); print('peak_ratio:', max(vals)/(sum(vals)/len(vals)))"
+
+python -c "from features import DB_PATH; import os; print(DB_PATH); print('Exists:', os.path.exists(DB_PATH))"  
+
+
+Airflow
+
+####terminal for the scheduler####
+cd ~/airflow_project
+source airflow_venv/bin/activate
+export AIRFLOW_HOME=~/airflow_project/airflow_home
+airflow scheduler
+
+###In a second WSL terminal, start the webserver###
+cd ~/airflow_project
+source airflow_venv/bin/activate
+export AIRFLOW_HOME=~/airflow_project/airflow_home
+airflow webserver --port 8080
+
+
+Check the webserver
+ps aux | grep "airflow webserver" | grep -v grep
+
+###Also check the DAG parses without errors##
+python $AIRFLOW_HOME/dags/DE7_end_to_end_dag.py
+echo "Exit code: $?"
+
+
+dit the actual file with nano
+nano $AIRFLOW_HOME/dags/DE7_end_to_end_dag.py
+
+
+Confirm the DAG is registered and unpaused
+airflow dags list | grep de7
+If it shows True (paused), unpause it:
+
+
+airflow dags unpause de7_end_to_end_pipeline
+
+Trigger
+airflow dags trigger de7_end_to_end_pipeline
+
+check the run's progress
+sleep 60
+airflow tasks states-for-dag-run de7_end_to_end_pipeline manual__2026-09-06T17:43:03+00:00

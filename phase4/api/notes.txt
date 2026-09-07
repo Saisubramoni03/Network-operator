@@ -1,0 +1,41 @@
+# Phase 4 — FastAPI: Network Intelligence Service Layer
+# Consolidated Notes: Workflow, Logic & API Contracts
+
+
+## THE BIG PICTURE — WHY PHASE 4 EXISTS
+
+Phases 2-3 built and orchestrated a pipeline that ends in a SQLite
+warehouse. That data is useless to React, ML, or Claude until it's
+exposed over HTTP. Phase 4's job: build ONE FastAPI app, incrementally,
+where each lab adds new endpoints to the SAME shared files — never
+computing anything from raw data, only reading from the warehouse.
+
+RULE THAT NEVER CHANGES ACROSS ALL 6 LABS: every endpoint queries
+fact_network_activity / dim_grid / dim_time (or reads a stored record
+like pipeline_status.json) — NEVER a raw CSV, NEVER country-code-level
+data.
+
+
+## PROJECT STRUCTURE (built once, added to every lab)
+
+    phase4/api/
+    ├── venv/                  <- dedicated venv for this phase
+    ├── requirements.txt        (fastapi, uvicorn, pydantic)
+    └── app/
+        ├── db.py               <- get_connection() — shared by ALL endpoints
+        ├── schemas.py          <- Pydantic response models — grows every lab
+        ├── service.py          <- business logic / SQL — grows every lab
+        └── main.py             <- FastAPI app + routes — grows every lab
+
+Every lab follows the SAME pattern:
+  1. Add new Pydantic model(s) to schemas.py
+  2. Add new function(s) to service.py (query the warehouse, return a dict)
+  3. Add new @app.get/@app.post route(s) to main.py (wraps the service
+     function, converts result to the response model, handles 404/500)
+
+
+## HOW TO RUN THE SERVER (the one recurring annoyance)
+
+Must run from phase4/api/ (the PARENT of app/), not from inside app/
+itself, and must use the venv's OWN python.exe explicitly (this
+machine's plain "python"/"pip"

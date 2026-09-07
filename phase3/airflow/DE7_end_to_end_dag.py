@@ -40,6 +40,9 @@ WAREHOUSE_DB_PATH = f"{PROJECT_ROOT}/phase3/warehouse/network_warehouse.db"
 STATUS_RECORD_PATH = f"{PROJECT_ROOT}/data/analytics/pipeline_status.json"
 NOTIFY_LOG_PATH = f"{PROJECT_ROOT}/logs/notify_log.jsonl"
 
+ML_SCRIPT_DIR = f"{PROJECT_ROOT}/phase6/ml"
+sys.path.insert(0, ML_SCRIPT_DIR)
+
 sys.path.insert(0, INGESTION_SCRIPT_DIR)
 sys.path.insert(0, WAREHOUSE_SCRIPT_DIR)
 
@@ -145,6 +148,21 @@ def notify_task(**context):
 
     print(f"NOTIFY: {outcome}")
 
+def generate_features_task(**context):
+    from features import build_feature_table, persist_feature_table
+    features_df = build_feature_table()
+    persist_feature_table(features_df)
+    metrics = {"grids_featured": int(features_df["grid_id"].nunique()), "feature_rows": len(features_df)}
+    print(f"Feature generation metrics: {metrics}")
+    return metrics
+
+
+def score_risk_task(**context):
+    from batch_score import run_batch_scoring
+    result = run_batch_scoring()
+    print(f"Batch scoring metrics: {result}")
+    return result
+
 
 default_args = {"owner": "sai", "retries": 0}
 
@@ -163,4 +181,4 @@ with DAG(
     quality_check = PythonOperator(task_id="quality_check", python_callable=quality_check_task)
     notify = PythonOperator(task_id="notify", python_callable=notify_task, trigger_rule=TriggerRule.ALL_DONE)
 
-    ingest_validate_route >> spark_process >> load_warehouse >> quality_check >> notify
+    ingest_validate_route >> spark_process >> load_warehouse >> generate_features >> score_risk >> quality_check >> notify

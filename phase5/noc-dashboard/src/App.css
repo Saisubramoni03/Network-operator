@@ -1,0 +1,291 @@
+:root {
+  --color-bg: #f4f6f8;
+  --color-surface: #ffffff;
+  --color-border: #e1e4e8;
+  --color-text: #1c2733;
+  --color-text-muted: #64748b;
+  --color-primary: #1e5fa8;
+  --color-primary-dark: #16457d;
+  --color-danger: #c0392b;
+  --color-danger-bg: #fdecea;
+  --color-danger-border: #f5c6cb;
+  --color-success: #1e8449;
+  --color-warning: #b9770e;
+  --radius: 8px;
+  --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.06);
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background-color: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+.app-shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---------- Navigation ---------- */
+.app-nav {
+  display: flex;
+  align-items: center;
+  gap: 2rem;
+  padding: 0 2rem;
+  height: 56px;
+  background-color: var(--color-primary-dark);
+  color: white;
+}
+
+.app-nav-brand {
+  font-weight: 700;
+  font-size: 1.05rem;
+  letter-spacing: 0.02em;
+}
+
+.app-nav-links {
+  display: flex;
+  gap: 1.5rem;
+}
+
+.app-nav-link {
+  color: rgba(255, 255, 255, 0.75);
+  text-decoration: none;
+  font-size: 0.9rem;
+  padding: 0.4rem 0;
+  border-bottom: 2px solid transparent;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.app-nav-link:hover {
+  color: white;
+}
+
+.app-nav-link.active {
+  color: white;
+  border-bottom-color: white;
+  font-weight: 600;
+}
+
+/* ---------- Content area ---------- */
+.app-content {
+  flex: 1;
+  padding: 2rem;
+  max-width: 1200px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.page-title {
+  font-size: 1.4rem;
+  font-weight: 700;
+  color: var(--color-text);
+  margin: 0 0 0.25rem 0;
+}
+
+.page-subtitle {
+  color: var(--color-text-muted);
+  font-size: 0.9rem;
+  margin: 0 0 1.5rem 0;
+}
+
+/* ---------- Cards (metric cards, panels) ---------- */
+.card {
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-card);
+  padding: 1.25rem;
+}
+
+.metric-card {
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-card);
+  padding: 1.1rem 1.25rem;
+  min-width: 170px;
+  text-align: left;
+}
+
+.metric-card-label {
+  font-size: 0.78rem;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 0.35rem;
+}
+
+.metric-card-value {
+  font-size: 1.6rem;
+  font-weight: 700;
+  color: var(--color-text);
+  font-family: var(--font-mono);
+}
+
+.metric-card-grid {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-top: 1rem;
+}
+
+/* ---------- Error banner ---------- */
+.api-unavailable-banner {
+  background-color: var(--color-danger-bg);
+  color: var(--color-danger);
+  border: 1px solid var(--color-danger-border);
+  border-radius: 6px;
+  padding: 0.85rem 1.1rem;
+  margin-bottom: 1.25rem;
+  font-size: 0.9rem;
+}
+
+/* ---------- Forms ---------- */
+.form-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+  flex-wrap: wrap;
+}
+
+.form-label {
+  font-size: 0.85rem;
+  color: var(--color-text-muted);
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+input[type="text"],
+input[type="number"],
+select {
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 0.45rem 0.65rem;
+  font-size: 0.9rem;
+  font-family: var(--font-sans);
+  background-color: var(--color-surface);
+  color: var(--color-text);
+}
+
+button {
+  background-color: var(--color-primary);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 0.5rem 1.1rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+button:hover:not(:disabled) {
+  background-color: var(--color-primary-dark);
+}
+
+button:disabled {
+  background-color: #cbd5e1;
+  cursor: not-allowed;
+}
+
+/* ---------- Tables ---------- */
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  background-color: var(--color-surface);
+  border-radius: var(--radius);
+  overflow: hidden;
+  box-shadow: var(--shadow-card);
+  font-size: 0.88rem;
+}
+
+.data-table th {
+  background-color: #eef2f6;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-align: left;
+  padding: 0.65rem 0.9rem;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.data-table td {
+  padding: 0.6rem 0.9rem;
+  border-bottom: 1px solid var(--color-border);
+  font-family: var(--font-mono);
+  color: var(--color-text);
+}
+
+.data-table tbody tr:hover {
+  background-color: #f7f9fb;
+}
+
+.data-table tbody tr.clickable {
+  cursor: pointer;
+}
+
+/* ---------- Severity badges ---------- */
+.badge {
+  display: inline-block;
+  padding: 0.2rem 0.55rem;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+
+.badge-high { background-color: #fdecea; color: var(--color-danger); }
+.badge-medium { background-color: #fdf3e3; color: var(--color-warning); }
+.badge-normal { background-color: #eafaf1; color: var(--color-success); }
+
+/* ---------- Model output / narrative panels (RE5) ---------- */
+.model-output-panel {
+  border: 2px solid var(--color-text);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+  min-width: 260px;
+  background-color: var(--color-surface);
+}
+
+.narrative-panel {
+  border: 2px dashed #b0b8c1;
+  border-radius: var(--radius);
+  padding: 1.25rem;
+  min-width: 260px;
+  background-color: #fafbfc;
+}
+
+.panel-title {
+  margin-top: 0;
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.panel-row {
+  margin: 0.35rem 0;
+  font-size: 0.92rem;
+}
+
+.panel-note {
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
+  font-style: italic;
+  margin-top: 0.5rem;
+}
