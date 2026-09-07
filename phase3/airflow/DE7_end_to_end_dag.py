@@ -109,7 +109,7 @@ def quality_check_task(**context):
     warehouse_result = ti.xcom_pull(task_ids="load_warehouse") or {}
 
     task_states = {}
-    for task_id in ["ingest_validate_route", "spark_process", "load_warehouse"]:
+    for task_id in ["ingest_validate_route", "spark_process", "load_warehouse", "generate_features", "score_risk"]:
         ti_state = context["dag_run"].get_task_instance(task_id)
         task_states[task_id] = ti_state.state if ti_state else "unknown"
 
@@ -178,7 +178,11 @@ with DAG(
     ingest_validate_route = PythonOperator(task_id="ingest_validate_route", python_callable=ingest_validate_route_task)
     spark_process = PythonOperator(task_id="spark_process", python_callable=spark_process_task)
     load_warehouse = PythonOperator(task_id="load_warehouse", python_callable=load_warehouse_task)
+    generate_features = PythonOperator(task_id="generate_features", python_callable=generate_features_task)
+    score_risk = PythonOperator(task_id="score_risk", python_callable=score_risk_task)
+
     quality_check = PythonOperator(task_id="quality_check", python_callable=quality_check_task)
     notify = PythonOperator(task_id="notify", python_callable=notify_task, trigger_rule=TriggerRule.ALL_DONE)
 
     ingest_validate_route >> spark_process >> load_warehouse >> generate_features >> score_risk >> quality_check >> notify
+
