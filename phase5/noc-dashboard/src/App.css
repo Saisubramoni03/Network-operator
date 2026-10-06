@@ -224,10 +224,16 @@ button:disabled {
 }
 
 .data-table td {
-  padding: 0.6rem 0.9rem;
+  padding: 0.75rem 1.1rem;
   border-bottom: 1px solid var(--color-border);
   font-family: var(--font-mono);
   color: var(--color-text);
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.data-table th {
+  padding: 0.75rem 1.1rem;
 }
 
 .data-table tbody tr:hover {

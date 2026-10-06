@@ -1,0 +1,311 @@
+# Phase 3 — Data Engineering: Productionize the Network Pipeline
+# Consolidated Notes: Workflow, Logic & Architecture
+
+
+## THE BIG PICTURE — WHY PHASE 3 EXISTS
+
+Phase 2 built a working Spark pipeline you had to run by hand. Phase 3's
+job is to turn that into a GOVERNED, ORCHESTRATED, RELIABLE system —
+files arrive and get validated automatically, the pipeline runs on a
+schedule/trigger without manual steps, failures are handled predictably
+instead of crashing silently, and everything is auditable.
+
+
+## OVERALL DATA FLOW (all of Phase 3 in one picture)
+
+    ┌─────────────┐
+    │ data/landing│  <- new daily CSV file arrives here first
+    └──────┬──────┘
+           │
+           ▼
+   ┌─────────────────────────────────────────┐
+   │  INGESTION (DE2)                         │
+   │  detect_files() -> validate_schema()     │
+   │  -> validate_minimum_quality()           │
+   │  -> validate_partial_corruption() (DE8)  │
+   │  -> route_file()                         │
+   └──────┬───────────────────────┬──────────┘
+          │ valid                 │ invalid
+          ▼                       ▼
+   ┌─────────────┐        ┌───────────────┐
+   │ data/raw/   │        │data/rejected/ │
+   │ (immutable, │        │ (with named   │
+   │ append-only)│        │  reason)      │
+   └──────┬──────┘        └───────────────┘
+          │
+          ▼
+   ┌─────────────────────────────────────────┐
+   │  SPARK PROCESSING (Phase 2 / SP7,        │
+   │  orchestrated by DE3/DE7)                │
+   │  clean() -> aggregate() -> enrich()      │
+   │  -> write_outputs()                      │
+   └──────┬────────────────────────┬─────────┘
+          │                        │
+          ▼                        ▼
+   ┌─────────────┐          ┌───────────────────┐
+   │data/processed│          │ data/analytics/    │
+   │  (Parquet,   │          │ hourly_grid_summary│
+   │  partitioned │          │ (Parquet, no geom) │
+   │  by date)    │          └─────────┬──────────┘
+   └─────────────┘                    │
+                                       ▼
+                          ┌─────────────────────────┐
+                          │  WAREHOUSE LOAD (DE6)     │
+                          │  dim_grid + dim_time      │
+                          │  + fact_network_activity  │
+                          │  (SQLite, star schema)    │
+                          └───────────┬──────────────┘
+                                      │
+                                      ▼
+                          ┌─────────────────────────┐
+                          │  QUALITY CHECK (DE7)      │
+                          │  writes pipeline_status   │
+                          │  .json (AS_OF, row counts)│
+                          └───────────┬──────────────┘
+                                      │
+                                      ▼
+                          ┌─────────────────────────┐
+                          │  NOTIFY (DE7)             │
+                          │  runs regardless of       │
+                          │  success/failure,          │
+                          │  writes notify_log.jsonl   │
+                          └─────────────────────────┘
+
+  data/reference/milano-grid.geojson (static) feeds directly into
+  Spark's enrich() step AND the warehouse's dim_grid load — it NEVER
+  passes through the ingestion flow above, by design.
+
+
+## DE1 — DESIGN THE TELECOM DATA ARCHITECTURE
+
+Design-only lab, no code. Learner sketches the architecture first
+(landing -> raw -> reference -> processed -> analytics -> consumers),
+Claude reviews/challenges rather than authoring it. Key architectural
+decision carried through the rest of Phase 3: GeoJSON is static
+REFERENCE data, never a daily ingestion candidate.
+
+
+## DE2 — BUILD THE LANDING-TO-RAW INGESTION FLOW
+
+Goal: validate files BEFORE they're trusted, quarantine bad ones with a
+NAMED reason (not a vague "invalid file").
+
+Built ingest.py with single-purpose functions:
+- detect_files()            -> glob-match sms-call-internet-mi-*.csv,
+                                ignore everything else (incl. GeoJSON)
+- validate_schema()          -> required columns present
+- validate_minimum_quality() -> empty file, malformed timestamp,
+                                negative values
+- validate_partial_corruption() (added in DE8) -> tolerate a few bad
+                                rows below a 5% threshold
+- route_file()               -> move to raw/ or rejected/
+- write_audit_record()       -> JSON-lines log: filename, status,
+                                row_count, reason, processed_at
+- already_processed()        -> re-running never silently duplicates
+                                work (SKIPPED status)
+
+Also required its OWN dedicated Airflow DAG (de2_ingestion_flow) showing
+detect -> validate -> route -> log as FOUR SEPARATE VISIBLE TASKS (not
+folded into one task like the bigger pipeline DAG does) — this was a
+gap we had to go back and fix after initially missing it.
+
+Proof: 6 passing pytest tests + real files routed correctly with real
+audit log entries.
+
+
+## DE3 — ORCHESTRATE THE SPARK PROCESSING JOB (AIRFLOW)
+
+Goal: wire ingestion -> Spark into ONE automated, ordered,
+failure-aware pipeline using real Apache Airflow (installed inside
+WSL2, since Airflow doesn't run natively on Windows).
+
+Task graph:
+    task_ingest -> task_spark -> task_publish
+
+Design rule: the DAG file itself contains ZERO business logic — it only
+calls existing, already-tested functions/scripts from ingest.py and
+telecom_pipeline.py.
+
+Real environment issues fixed along the way:
+- Missing JAVA_HOME inside WSL
+- Missing pyspark in the WSL-side Airflow virtual environment
+- Spark reading files across the WSL<->Windows filesystem boundary
+  (/mnt/c/...) was 20+ minutes slow -> fixed by copying data to WSL's
+  NATIVE filesystem (~/network_data) and pointing Spark there instead
+
+Proof: failure propagation demonstrated TWICE for real (empty landing
+folder -> task_ingest failed -> downstream never ran; missing pyspark
+-> task_spark failed -> task_publish never ran), then a full genuine
+success with real Parquet/CSV outputs and Spark's structured log
+correctly captured inside Airflow's task logs.
+
+
+## DE4 — BATCH VS STREAMING DECISION WORKSHOP
+
+Design-only lab (discussion, no code). Classified 6 scenarios:
+
+  Scenario                    | Latency needed | Decision
+  -----------------------------+----------------+----------
+  Daily usage summary          | 24h            | Batch
+  Live activity events (hypo.) | 1-10 sec       | Streaming
+  Billing report               | 24-48h         | Batch
+  Hotspot alerts                | 5-15 min       | Batch (micro-batch)
+  Executive dashboard refresh   | hours          | Batch
+  Model training & scoring      | hrs / 5-15min  | Batch (both)
+
+Key required justification: "batch, because streaming adds cost
+without adding value" — hotspot alerts, since the SOURCE data itself
+only updates hourly, so streaming can't make it any fresher, just more
+expensive/complex.
+
+
+## DE5 — STORAGE STRATEGY & DATA ZONES
+
+Design-only lab (written contract). For every zone: format, write mode
+(append-only vs overwrite), partitioning, retention.
+
+  Zone              | Format  | Write mode  | Partitioned by date?
+  ------------------+---------+-------------+----------------------
+  landing/          | CSV     | transient   | no (empty between runs)
+  raw/              | CSV     | append-only | no (filename encodes date)
+  rejected/         | CSV     | append-only | no
+  reference/        | GeoJSON | overwrite   | NO -- static, not periodic
+  processed/        | Parquet | overwrite   | YES -- queries filter by date
+  analytics/        | Parquet | overwrite   | only where it earns its keep
+  logs/             | JSONL   | append-only | no (partitioned by run_id
+                    |         |             | naturally via Airflow)
+
+Why raw/ is immutable: if it could be edited, you lose the ability to
+reproduce any historical analytics output from scratch after a bug fix.
+
+Why GeoJSON is NOT date-partitioned: it's a DIMENSION (rarely changes),
+not a FACT (recurring per period) — partitioning it by date would
+incorrectly imply grid geometry changes day to day.
+
+
+## DE6 — WAREHOUSE MODELLING FOR NETWORK ANALYTICS
+
+Goal: build a proper STAR SCHEMA (SQLite) from the Spark Parquet output.
+
+  dim_grid                  dim_time                fact_network_activity
+  ---------                 --------                 ----------------------
+  grid_id (PK)               time_id (PK)             fact_id (PK)
+  centroid_lon               timestamp (unique)       grid_id (FK)
+  centroid_lat                date                     time_id (FK)
+  geometry_ref                hour                     sms_in, sms_out,
+                              day_of_week               call_in, call_out,
+                                                        internet_activity,
+                                                        total_activity
+                                                        (NO geometry here)
+
+Indexes: idx_fact_grid, idx_fact_time, idx_dim_time_timestamp (created
+AFTER bulk insert, not before -- much faster for 1.68M rows).
+
+Proof: fact row count == source Parquet row count (no fan-out from the
+join), dim_grid has zero duplicates (10,000 rows), SQL aggregate sum
+matches source aggregate sum exactly, three sample queries (top grids,
+hourly trend, internet-heavy windows) all produced sensible, mutually
+consistent results.
+
+
+## DE7 — END-TO-END AIRFLOW ORCHESTRATION
+
+Goal: ONE trigger, full flow, single unambiguous outcome:
+
+    ingest_validate_route -> spark_process -> load_warehouse
+    -> quality_check -> notify
+
+quality_check writes a machine-readable pipeline_status.json:
+  { run_id, run_timestamp, task_status{...},
+    rows_in, rows_rejected, nulls_handled, rows_published, AS_OF }
+
+notify uses TriggerRule.ALL_DONE -- it runs REGARDLESS of upstream
+success or failure, writing a distinguishable outcome to
+notify_log.jsonl every single time. This is critical: a pipeline that
+only reports when it succeeds is not operationally trustworthy.
+
+Real bugs hit and fixed:
+- Metrics parser only checked stdout, but Python's logging module
+  writes to stderr by default -> fixed by scanning BOTH streams
+- pyarrow missing in the WSL Airflow venv -> installed
+- A DAG file got corrupted to literally one placeholder line during a
+  copy-paste -> rewritten correctly via nano
+- Scheduler kept dying when run in the same terminal as other commands
+  -> fixed by giving it its own dedicated, untouched terminal
+
+Also produced two required docs:
+- de7_troubleshooting_map.md -- maps each failure symptom to the exact
+  module to open first
+- architecture_to_dag_mapping.md -- maps each architecture layer to its
+  DAG task and underlying source file
+
+
+## DE8 — NETWORK PIPELINE RELIABILITY CHALLENGE (final Phase 3 lab)
+
+Goal: classify ALL required fault types and DEMONSTRATE at least 3
+controls live, plus prove safe reruns don't corrupt the warehouse.
+
+  Fault type                  | Action           | Status
+  -----------------------------+------------------+------------------
+  1. Missing daily file        | CONTINUE          | NEW, demonstrated
+  2. Duplicate ingestion       | CONTINUE (skip)   | already existed
+  3. Malformed timestamp       | REJECT            | already existed
+  4. Negative activity value   | REJECT            | already existed
+  5. Missing/unexpected column | REJECT            | already existed
+  6. Partial file corruption   | WARN + CONTINUE   | NEW, demonstrated
+  7. Spark job failure         | FAIL              | already existed
+
+Control #1 fix: removed the "raise if nothing accepted" check in
+ingest_validate_route_task -- an empty landing/ folder is normal, not
+an error.
+
+Control #6 fix: added validate_partial_corruption() (tolerates bad rows
+below a 5% threshold) -- but ALSO had to fix validate_minimum_quality()
+itself to use on_bad_lines="skip", since it was crashing on malformed
+rows before the tolerant check ever got a chance to run.
+
+Real evidence captured:
+- Missing file -> WARN logged, pipeline continued normally
+- Duplicate -> SKIPPED, "Already processed in a prior run"
+- Partial corruption (1 bad row in 1000) -> ACCEPTED_WITH_WARNINGS,
+  "PARTIAL_CORRUPTION_TOLERATED: 1 of 1000 rows skipped (0.1%)"
+- Safe rerun proof: SELECT COUNT(*) for duplicate (grid_id, time_id)
+  pairs in the warehouse after multiple runs -> result: 0
+
+
+## RECURRING THEMES ACROSS ALL OF PHASE 3
+
+1. Silent failures are still the enemy -- every validation exists to
+   turn a silent wrong-answer into a loud, specific, named failure.
+2. Orchestration code (DAGs) and business logic (cleaning, aggregation,
+   warehouse modeling) must live in physically separate files -- a DAG
+   that contains real logic can't be tested independently of Airflow.
+3. "Fail fast" and "tolerate gracefully" are BOTH correct, depending on
+   the fault type -- the skill is knowing which fault deserves which
+   treatment (reject vs warn+continue vs continue vs hard-fail).
+4. A pipeline isn't trustworthy until it can prove two things: (a) it
+   reports failure just as clearly as success (notify with
+   ALL_DONE), and (b) re-running it never corrupts prior good state
+   (safe rerun / idempotency).
+5. Environment debugging (Java paths, Python versions, WSL filesystem
+   performance, scheduler process management) is a real, unavoidable
+   part of data engineering work -- not a distraction from "the real
+   work," but part of it.
+
+
+## ENVIRONMENT SETUP SUMMARY (WSL2 + Airflow, useful reference)
+
+- Airflow does not run natively on Windows -> installed inside WSL2
+  Ubuntu, in its own dedicated Python 3.11 virtual environment
+  (separate from the Phase 2 Windows venv)
+- JAVA_HOME and pyspark/pyarrow had to be installed/configured
+  SEPARATELY inside the WSL venv -- nothing carries over from Windows
+- Large CSV reads across /mnt/c/... (Windows filesystem, from WSL) are
+  dramatically slower than native WSL filesystem reads -- copy large
+  data to ~/network_data (or similar) before heavy Spark processing
+- The Airflow scheduler MUST run continuously in its own dedicated
+  terminal that is never used for anything else -- typing other
+  commands into that terminal, or letting the machine sleep, can kill
+  the scheduler process and strand all queued tasks at state "None"
+- Always verify with `ps aux | grep "airflow scheduler"` (expect
+  exactly 2 processes) before trusting that a trigger will actually run

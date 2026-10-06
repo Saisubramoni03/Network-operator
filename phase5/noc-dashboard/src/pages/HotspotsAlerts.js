@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { apiGet } from "../api/client";
 import { useMilanGrid } from "../context/MilanGridContext";
 import { buildGridLookup, getPolygonPoints } from "../hooks/gridLookup";
+import { MapContainer, TileLayer, Polygon, Popup } from "react-leaflet";
 
 // Milan's real-world bounding box, used to project lon/lat -> SVG pixels
 const LON_MIN = 9.0, LON_MAX = 9.3;
@@ -85,13 +86,12 @@ function HotspotsAlerts() {
       <div className="form-row">
         <label className="form-label">
           Limit:
-          <input
-            type="number"
-            value={limit}
-            min={1}
-            max={100}
-            onChange={(e) => setLimit(Number(e.target.value))}
-          />
+          <select value={limit} onChange={(e) => setLimit(Number(e.target.value))}>
+            <option value={5}>5</option>
+            <option value={10}>10</option>
+            <option value={15}>15</option>
+            <option value={20}>20</option>
+          </select>
         </label>
         <label className="form-label">
           Severity:
@@ -137,35 +137,96 @@ function HotspotsAlerts() {
           </table>
         </div>
 
-        {/* Map */}
-        <div className="card">
+         {/* Ranked Alerts */}
+        <div style={{ flex: "1", minWidth: "320px" }}>
+          <h3 className="panel-title">Ranked Alerts</h3>
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Grid</th>
+                <th>Timestamp</th>
+                <th>Alert Type</th>
+                <th>Current</th>
+                <th>Baseline</th>
+              </tr>
+            </thead>
+            <tbody>
+              {alerts.map((a) => (
+                <tr
+                  key={`${a.grid_id}-${a.alert_type}`}
+                  className="clickable"
+                  onClick={() => navigate(`/grid?grid_id=${a.grid_id}`)}
+                >
+                  <td>{a.grid_id}</td>
+                  <td>{a.timestamp}</td>
+                  <td>
+                    <span className={a.alert_type === "HIGH_ACTIVITY" ? "badge badge-high" : "badge badge-medium"}>
+                      {a.alert_type}
+                    </span>
+                  </td>
+                  <td>{a.current_activity.toFixed(1)}</td>
+                  <td>{a.baseline_activity.toFixed(1)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+                {/* Map — real Milan map via OpenStreetMap tiles, flagged grids overlaid */}
+        <div className="card" style={{ minWidth: "1000px" }}>
           <h3 className="panel-title">Milan Grid Map</h3>
           {geoLoading ? (
             <p>Loading grid geometry...</p>
           ) : (
-            <svg width={SVG_WIDTH} height={SVG_HEIGHT} style={{ border: "1px solid var(--color-border)", background: "#f7f7f7", borderRadius: "6px" }}>
+            <MapContainer
+              center={[45.4642, 9.19]}  // Milan city center
+              zoom={12}
+              style={{ height: "600px", width: "100%", borderRadius: "6px", border: "1px solid var(--color-border)" }}
+            >
+              <TileLayer
+                attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+              />
               {Array.from(flaggedGrids.entries()).map(([gridId, info]) => {
                 const feature = gridLookup.get(gridId);
                 if (!feature) return null;
-                const points = getPolygonPoints(feature)
-                  .map(([lon, lat]) => project(lon, lat).join(","))
-                  .join(" ");
+
+                // Leaflet wants [lat, lon] pairs, GeoJSON stores [lon, lat] — swap here
+                const positions = getPolygonPoints(feature).map(([lon, lat]) => [lat, lon]);
                 const style = severityMapStyle(info.severity);
+
                 return (
-                  <polygon
+                  <Polygon
                     key={gridId}
-                    points={points}
-                    fill={style.fill}
-                    stroke={style.stroke}
-                    strokeWidth={style.strokeWidth}
-                    style={{ cursor: "pointer" }}
-                    onClick={() => navigate(`/grid?grid_id=${gridId}`)}
+                    positions={positions}
+                    pathOptions={{
+                      fillColor: style.fill,
+                      color: style.stroke,
+                      weight: style.strokeWidth,
+                      fillOpacity: 0.6,
+                    }}
                   >
-                    <title>{`Grid ${gridId} — ${severityLabel(info.severity)}`}</title>
-                  </polygon>
+                    <Popup>
+                      <div style={{ fontFamily: "var(--font-mono)" }}>
+                        <strong>Grid {gridId}</strong>
+                        <br />
+                        Status:{" "}
+                        <span className={severityBadgeClass(info.severity)}>
+                          {severityLabel(info.severity)}
+                        </span>
+                        <br />
+                        <button
+                          style={{ marginTop: "0.5rem", fontSize: "0.8rem", padding: "0.3rem 0.6rem" }}
+                          onClick={() => navigate(`/grid?grid_id=${gridId}`)}
+                        >
+                          View Grid Details
+                        </button>
+                      </div>
+                    </Popup>
+                  </Polygon>
                 );
               })}
-            </svg>
+            </MapContainer>
           )}
         </div>
       </div>

@@ -1,0 +1,118 @@
+Phase 1 — NP1: Profile the Telecom Activity Dataset
+
+Data: one daily CSV · Autonomy level: Low–Medium (LEARN / PAIR)
+
+Business / Training Scenario
+
+The NOC (Network Operations Center) data team gets a raw network activity extract. Before writing any processing logic, you need to understand what one row in the data actually represents, and spot the data-quality risks that will follow this data all the way to the dashboard.
+
+Goal
+
+Understand the source structure, quality, and time/grid characteristics of the data — before doing any transformation.
+
+What you actually need to do (Student Activities)
+Load one sms-call-internet-mi-YYYY-MM-DD.csv file with pandas; check shape, raw columns, and dtypes.
+Map raw columns to a standardized "canonical" schema: datetime, CellID, countrycode, smsin, smsout, callin, callout, internet.
+Parse the timestamp field and verify hourly cadence — confirm there are exactly 24 distinct timestamps, one hour apart. Then derive date, hour, day_of_week.
+Check for missing grid_id, missing timestamp, blank activity measures, exact duplicates, and negative values. Don't alter the raw file — document a separate null-handling policy for later.
+Check how many country-code rows exist per grid/hour — confirm the raw grain is timestamp + grid_id + country_code (i.e., a grid can have multiple rows per hour, one per country code).
+Create derived measures: total_sms, total_calls, total_activity.
+Compute profiling facts: unique grid count, time range, cadence, country-code categories, busiest hour, busiest grid, null counts per column.
+Write a five-bullet summary addressed to the Network Analytics Team.
+Key Concepts
+read_csv, dtypes, isnull, duplicated, value_counts
+datetime conversion, cadence validation, time-derived fields
+raw grain (country-code level) vs. later grid/hour analytics grain
+Important: this is grid-based activity data, NOT customer-level CRM data — don't treat it like one
+Expected Output
+Five-bullet profiling report for the Network Analytics Team
+Canonicalized DataFrame using the project schema
+Initial derived measures (total_sms, total_calls, total_activity)
+⚠️ Known Trap (important!)
+
+The negative-value check and exact-duplicate check will both return zero on the real supplied file. That's correct — not a bug. Faulty/injected data only shows up later (DE2, DE8), so don't waste time debugging code that's actually working.
+
+How you're expected to use Claude here
+
+You (the learner) own understanding what a raw row means and making the first profiling decisions — Claude shouldn't write the first version of your pandas code. Claude's role is to help inspect the actual CSV and explain findings, not hand you a ready-made solution.
+
+Self-check before calling it done
+Can you say what one row represents? → One hourly activity record for a grid, for one country-code category.
+Can you explain why the same grid_id + timestamp can appear in multiple rows? → because of different countrycode values
+Exactly 24 distinct timestamps, one hour apart ✓
+Every grid_id between 1–10000 ✓
+Null counts documented, blank-activity count explained (not silently dropped) ✓
+Summary uses "activity" language only — no mention of message counts, MB, towers, or customers ✓
+
+Connects to: NP2 (next lab), and later SP1 in Phase 2.
+
+Want me to move to NP2 next, or do you want to work through NP1 first (e.g., help writing the actual pandas code or the profiling summary)?
+
+
+NP2
+
+Good — this is the actual NP1→NP2 design-review step, so per the lab I'll give you responsibilities only, no code yet. Here's the proposed design:
+
+Proposed UsageProcessor Design
+Class-level responsibilities
+Accepts either a file path or an already-loaded DataFrame at construction — never re-reads or re-derives anything implicitly.
+Holds state across pipeline stages: raw_df (untouched), clean_df (post-cleaning, still country_code grain), grid_time_df (post-aggregation, grid/hour grain), plus KPI outputs.
+Tracks counters as it runs: rows in, rows rejected (missing keys), rows rejected (negative values), nulls handled, rows out — these feed the log line at the end, not printed ad hoc per method.
+load_data()
+Responsibility: get raw data into memory and validate it's usable — nothing else.
+Reads the CSV (or accepts the passed DataFrame), applies the raw→canonical column rename, and checks all required canonical columns are present.
+Raises a clear exception if required columns are missing (fail fast, don't silently continue with partial data).
+Stores result in self.raw_df and never mutates it again — this is the "preserve raw input unchanged" guarantee. Every later method reads from a copy, not from raw_df directly.
+Logs: rows loaded.
+clean_data()
+Responsibility: apply the documented curated-layer rules, at the country-code grain — no aggregation yet.
+Rejects rows with missing grid_id or timestamp (hard drop — these can't be assigned to any grain).
+Rejects rows with negative activity values (data-quality violation, not a valid business case).
+Applies the curated-layer null-handling rule to blank activity measures (fill/zero per the documented policy) — and counts how many null cells it handled, since that count is a required log output, not just a side effect.
+Does not touch country_code, does not aggregate — that's explicitly a separate method's job.
+Logs: input rows, rejected-missing count, rejected-negative count, nulls handled.
+derive_time_features()
+Responsibility: turn timestamp into usable time dimensions, still at country-code grain.
+Derives date, hour, day_of_week from timestamp.
+Pure derivation — no filtering, no dropping, no aggregation.
+aggregate_to_grid_time()
+Responsibility: the grain transition — this is the method the whole lab is actually testing, so it deserves to be isolated and named, not folded into clean_data().
+Groups by grid_id + timestamp (+ derived time fields), summing the five activity measures across all country_code rows.
+country_code is dropped here by design — it does not appear past this point in the main analytics path.
+Asserts/validates internally: zero duplicates on (grid_id, timestamp) in the output, and output row count strictly less than input row count. These are the two facts that prove the aggregation actually ran, not just that the method was called.
+Logs: input rows, output rows (so the "fewer rows than input" claim is auditable, not just asserted).
+derive_activity_features()
+Responsibility: compute total_sms, total_calls, total_activity — but only after the grain transition, so these are meaningful per-grid/hour figures rather than per-country-code fragments.
+Pure derivation on grid_time_df.
+compute_kpis()
+Responsibility: produce the daily and grid-level summary tables — reads only from grid_time_df (the grid/hour grain), never re-loads or re-cleans anything.
+This isolation is the answer to the trainer's discussion question: KPIs must be computed on already-clean, already-aggregated data so the method stays testable independent of loading/cleaning concerns.
+Outputs two tables: daily_summary, grid_summary.
+export_summary()
+Responsibility: write daily_summary.csv and grid_summary.csv to disk, and emit the final structured log line with all four required numbers together: input rows, rows rejected, nulls handled, output rows.
+No computation here — purely I/O and the final audit log.
+Where the "reject vs. handle" line is drawn
+Missing grid_id/timestamp → rejected (dropped), because there's no valid grain to assign the row to.
+Negative activity values → rejected (dropped), because they're not valid business values, not "missing."
+Blank/null activity measures → handled per the curated-layer rule (not dropped), and the count is reported separately from rejections — these are different categories of data-quality issue and the log should distinguish them.
+
+
+
+What the process actually did (recap)
+Started from grid/hour data, not raw data — because alerts must operate on the analytics grain (one row per grid/hour), never on raw country-code rows. Using NP2's grid_time_df guarantees that.
+Built a within-day baseline instead of an hour-of-day baseline — because with only one day of data, an hour-of-day baseline (groupby(["grid_id","hour"])) would have exactly one observation per bucket, making every deviation zero. The median of the other 23 hours is the only baseline that's actually computable right now.
+Applied an activity floor derived from the data (10th percentile of daily grid totals) — so near-silent grids don't dominate the alert list with meaningless ratio spikes (e.g., 1→3 units looks like a 200% spike but is just noise).
+Applied three independent rules — HIGH_ACTIVITY and ACTIVITY_DROP compare against the within-day baseline; ACTIVITY_SPIKE compares only against the immediately preceding hour (a different, faster signal).
+Checked alert volume is plausible — if a large share of all grid/hours alert, the thresholds are wrong, not the data.
+Exported alerts + validated one by hand — proving the baseline genuinely excludes the current hour's own value, not just trusting the code.
+Wrote the limitation statement — this is a graded deliverable. It names the exact blind spot (no concept of "normal for this hour of day") and explains why — this is the conceptual seed for ML4 later.
+Which file to create first
+
+Based on the project's canonical repo structure, here's the order:
+
+data/raw/sms-call-internet-mi-2013-11-01.csv — put your actual dataset here first. Nothing else works without it, and this folder is meant to hold the immutable, accepted raw file (never edit it in place).
+notebooks/phase1_np1_np2_np3.ipynb (or split into np1_profiling.ipynb, np2_processor.ipynb, np3_alerts.ipynb) — Phase 1 work is exploratory/notebook-based; it's not yet part of the production spark/, api/, etc. structure — that comes in later phases.
+data/processed/ — created automatically by your export_summary() and alert-export code (os.makedirs(..., exist_ok=True)), so you don't need to create it manually — just make sure the parent data/ folder exists.
+docs/np3_baseline_limitations.md — the written limitation statement gets saved here; create the docs/ folder if it doesn't exist yet (it's used again in later phases for architecture.md, data_contract.md, etc.).
+
+So practically: create your data/raw/ folder and drop the CSV in first — everything else (data/processed/, docs/) can be created on the fly by the code itself.

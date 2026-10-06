@@ -66,3 +66,12 @@ airflow dags trigger de7_end_to_end_pipeline
 check the run's progress
 sleep 60
 airflow tasks states-for-dag-run de7_end_to_end_pipeline manual__2026-09-06T17:43:03+00:00
+
+
+$env:Path += ";C:\Users\sai.subramoni\AppData\Roaming\npm"     
+
+
+load api key
+
+$env:ANTHROPIC_API_KEY = python -c "from dotenv import load_dotenv; import os; load_dotenv('phase7/claude/.env', override=True); print(os.environ['ANTHROPIC_API_KEY'])"
+

@@ -1,0 +1,82 @@
+Network equipment shortages are detected too late because supply-chain data, vendor performance, contracts, 
+maintenance schedules,and network rollout plans are stored in separate systems 
+and are not cross-referenced. As a result, the organization 
+ cannot proactively identify which equipment may be delayed and which upcoming 
+ network activities will be affected.
+
+
+
+
+
+
+
+
+
+
+                    USER
+                      │
+                      │ Natural-language question
+                      ▼
+              ┌─────────────────┐
+              │     SYNAPT      │
+              │ AI Intelligence │
+              │     Layer       │
+              └────────┬────────┘
+                       │
+              Understands question
+                       │
+          ┌────────────┴────────────┐
+          ▼                         ▼
+   ┌──────────────┐          ┌──────────────┐
+   │ MCP Server   │          │ Knowledge    │
+   │              │          │ Graph        │
+   └──────┬───────┘          └──────────────┘
+          │
+    ┌─────┴───────────────────────────────┐
+    │                                     │
+    ▼                                     ▼
+Procurement / ERP                    Documents
+    │                                     │
+    ├── Purchase Orders                   ├── Vendor Contracts
+    ├── Delivery Records                  ├── Penalty Clauses
+    ├── Inventory                         ├── Substitution Rights
+    ├── Vendor Data                       └── Agreements
+    │
+    ▼
+Network Planning Data
+    │
+    ├── Maintenance Calendar
+    ├── Site Rollout Schedule
+    └── Equipment Requirements
+
+
+
+5. Example of the final Synapt answer
+
+User asks:
+
+"Will any equipment shortage affect the Bangalore rollout scheduled next month?"
+
+Synapt could answer:
+
+Yes. The Bangalore rollout is at high risk due to a potential shortage of RF Module X.
+
+Reasoning:
+
+The rollout requires 500 units.
+Current available inventory is 120 units.
+380 additional units are dependent on PO-1045.
+The supplier's historical delivery records show an average delay of approximately 6 weeks for this module.
+The planned delivery date is October 20, while the rollout requires the equipment before November 5.
+The vendor contract contains a substitution clause that permits an approved alternate module.
+
+Recommended action:
+
+Check availability with the secondary distributor.
+Invoke the substitution clause if technically approved.
+Escalate PO-1045 with the primary vendor.
+Consider expedited shipping before the shortage enters the rollout critical path.
+
+This is much more valuable than simply returning:
+
+"PO-1045 is delayed."

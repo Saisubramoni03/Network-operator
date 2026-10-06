@@ -38,4 +38,224 @@ Every lab follows the SAME pattern:
 
 Must run from phase4/api/ (the PARENT of app/), not from inside app/
 itself, and must use the venv's OWN python.exe explicitly (this
-machine's plain "python"/"pip"
+machine's plain "python"/"pip" commands kept resolving to the wrong,
+global Python installation instead of the active venv):
+
+    cd C:\...\Networkproject\phase4\api
+    C:\...\phase4\api\venv\Scripts\python.exe -m uvicorn app.main:app --reload
+
+Swagger UI (test every endpoint without needing curl):
+    http://127.0.0.1:8000/docs
+
+
+## THE SHARED AS_OF CONCEPT (used by almost every endpoint)
+
+Every endpoint that reports "current" data accepts an OPTIONAL as_of
+query parameter. If omitted, the code computes:
+
+    SELECT MAX(timestamp) FROM dim_time
+
+...and uses THAT as the effective reporting timestamp. A hardcoded
+date is never allowed anywhere in this codebase — this was checked and
+proven explicitly: calling an endpoint with NO as_of, then again with
+an EXPLICIT as_of matching what was returned, must produce identical
+results, proving the default is genuinely computed, not hardcoded.
+
+
+## API1 — NETWORK SUMMARY ENDPOINT
+
+GET /network/summary?as_of=...
+
+Returns: total_activity, active_grids, peak_hour, top_grid, as_of
+
+Logic: SUM/COUNT DISTINCT/GROUP BY queries against
+fact_network_activity JOIN dim_time, filtered to
+WHERE t.timestamp <= as_of.
+
+Proof: hand-ran the equivalent raw SQL directly against the .db file
+and confirmed every field matched exactly. Called with no as_of and
+confirmed the returned as_of was a genuinely independent MAX(timestamp)
+computation, not a repeated/hardcoded value.
+
+
+## API2 — GRID ACTIVITY DRILL-DOWN ENDPOINT
+
+GET /network/grid/{grid_id}?as_of=...&date=...&hour=...
+
+grid_id is a PATH param (identifies a specific resource), not a query
+param (which would imply filtering) — this distinction matters for
+REST design correctness.
+
+Returns: grid_id, as_of, points[] (each point = timestamp + 5 activity
+measures + total_activity)
+
+Logic:
+- grid_id validated against 1-10000 BEFORE touching the DB (an
+  out-of-range query would just return empty rows, which is NOT the
+  same as a proper 404)
+- default window: trailing 24 hourly rows ending at as_of
+  (ORDER BY timestamp DESC LIMIT 24, then reversed for chronological order)
+- optional explicit date/hour filters override the default window
+
+Proof: grid 4821 returned exactly 24 points, all unique consecutive
+hourly timestamps. grid_id=0 and grid_id=10001 both returned clean 404s
+("Valid range is 1-10000"), not 500s or empty 200s. Spot-checked the
+last 3 points against a direct SQL query on the .db file — exact match
+to the decimal.
+
+
+## API3 — HOTSPOT & ALERT ENDPOINTS
+
+GET /network/hotspots?as_of=...&limit=...&severity=...
+GET /network/alerts?as_of=...&limit=...&severity=...
+
+CRITICAL WORDING RULE: the word "congestion" must NEVER appear
+anywhere in these responses — use "hotspot", "alert", or "operational
+attention" only.
+
+ADDITIVE-SAFE SCHEMA: both response items already include risk_score,
+risk_level, model_version fields — set to null for now. This is
+deliberate: later ML labs (ML-something) will populate these WITHOUT
+needing a schema change, because the fields already exist in the
+contract.
+
+Hotspots logic: rank all grids by total_activity at the given hour;
+top 5% = "high" severity, rest = "medium".
+
+Alerts logic: same within-day-baseline idea as Phase 1's NP3, but
+extended — compares each grid's current-hour activity against that
+grid's own AVERAGE across the whole dataset (not just "the rest of
+today", since multiple days of history now exist). Ratio >= 1.5x =
+HIGH_ACTIVITY, ratio <= 0.5x = ACTIVITY_DROP.
+
+Proof: limit=5 returned exactly 5 items on both endpoints. Zero
+occurrences of "congestion" anywhere in either response. All returned
+grid_ids confirmed to genuinely exist in dim_grid via a direct COUNT
+query.
+
+
+## API4 — GRID FEATURE ENDPOINT
+
+GET /network/grid/{grid_id}/features
+
+CORE PRINCIPLE (the actual point of this lab): "the API reads
+features, it does not compute them." A new grid_features table was
+added to the warehouse schema (DE6_build_warehouse.py) — but it stays
+EMPTY for now, since it's meant to be populated later by ml/features.py
+(ML2, Phase 6), which doesn't exist yet.
+
+Required behavior: a grid with no stored features returns a CLEAR,
+EXPLICIT ERROR (404 naming ml/features.py specifically), never zeros
+and never a fake computed value.
+
+Proof: called on grid 4821 (which genuinely has activity data) and got
+exactly the expected 404 — this IS the correct, complete state for
+this endpoint right now. Once ML2 populates grid_features later, this
+same endpoint will start returning real data with ZERO code changes.
+
+
+## API5 — PREDICTION ENDPOINT (STUB -> REAL MODEL)
+
+POST /network/predict-risk
+Body: {"grid_id": int, "as_of": optional string}
+
+STUB implementation: always returns risk_score=0.0, risk_level=
+"unknown", model_version="stub-v0", with an explanation_note stating
+plainly that this is a placeholder.
+
+CORE PRINCIPLE: define the CONTRACT now (exact field names/types),
+let ML5 (Phase 6) replace only the INTERNAL LOGIC later — the contract
+itself must never change when the real model is wired in. model_version
+is the required signal that lets any caller detect "is this a real
+prediction or still a stub" without needing a separate flag.
+
+Proof (3 required tests):
+- valid request (grid_id: 4821) -> 200, stub values as expected
+- missing required field ({}) -> 422 (Pydantic validation error, not
+  500 or a silent default)
+- invalid grid (99999) -> 404
+
+Wrote docs/api5_predict_risk_contract.md — the actual spec ML5 must be
+checked against later.
+
+
+## API6 — OPERATIONAL SUPPORT ENDPOINTS (final Phase 4 lab)
+
+GET /pipeline/status
+GET /network/grid/{grid_id}/location
+
+These two endpoints exist for ONE specific future purpose: the Claude
+assistant (Phase 7) needs real evidence sources to answer "can I trust
+this data?" and "where is this grid?" — without them, Claude would
+have to either refuse or make something up.
+
+/pipeline/status:
+- reads DE7's OWN quality_check status record directly — NEVER
+  recomputes health independently (two sources of truth for health is
+  worse than none)
+- "healthy" DEFINITION (a judgment call, established explicitly in
+  this lab): true only if ALL THREE tracked tasks
+  (ingest_validate_route, spark_process, load_warehouse) show
+  "success". Any other status -> healthy=false, with a reasons[] list
+  naming the exact failed task(s).
+- also exposes the same as_of value API1 uses, and a human-readable
+  freshness string (age of the run, independent of success/failure —
+  an old-but-correct run is still trustworthy, just not current)
+
+/network/grid/{grid_id}/location:
+- reads dim_grid only
+- returns centroid_lat, centroid_lon, and a polygon_ref (a FILE PATH
+  reference) — deliberately NEVER the full polygon coordinate geometry
+
+Proof (the required test): deliberately edited pipeline_status.json to
+set spark_process to "failed", re-called /pipeline/status, and
+confirmed it correctly returned healthy=false with the reason
+"Task 'spark_process' status is 'failed', expected 'success'." — proving
+the endpoint genuinely detects failure rather than reporting stale
+success. Also confirmed grid 4821's centroid (lat 45.459, lon 9.073)
+falls inside Milan's real bounding box, and confirmed the response
+contains no polygon coordinate array.
+
+Wrote docs/api6_evidence_sources.md — explicitly documents both
+endpoints as the sanctioned Claude-phase evidence sources.
+
+
+## RECURRING THEMES ACROSS ALL OF PHASE 4
+
+1. NEVER hardcode a date — always derive as_of from MAX(timestamp),
+   and always PROVE the default path independently returns the same
+   real computed value, not a repeated one.
+2. Path params vs query params matter: grid_id identifies WHICH
+   resource (path), as_of/limit/severity FILTER that resource (query).
+3. Validate before querying, not after: grid_id range-checked BEFORE
+   hitting the database, so out-of-range always means a clean 404,
+   never an empty-but-successful 200.
+4. Additive-safe schemas: build placeholder fields (risk_score,
+   risk_level, model_version) into the contract NOW, so future labs
+   populate them without ever needing a breaking schema change.
+5. "Clear error, not zeros" — an API should never silently substitute
+   a fake/default value when real data doesn't exist yet; it should
+   say so explicitly (API4's whole design point).
+6. One source of truth for health/status — an endpoint must READ an
+   existing record (DE7's quality_check output), never independently
+   recompute a second, possibly-conflicting version of the same fact.
+7. Every one of these design principles was actually TESTED, not just
+   asserted — hand-run SQL comparisons, deliberate 404 triggers,
+   deliberate failure injection into pipeline_status.json — proof over
+   assumption, the same theme carried through every phase of this
+   project.
+
+
+## ENVIRONMENT NOTES (Phase 4 specific)
+
+- This machine's plain "python"/"pip"/"uvicorn" commands unreliably
+  resolve to the WRONG (global) Python install even when a venv shows
+  as active in the prompt — the reliable workaround used throughout
+  this phase was always calling the venv's python.exe by its FULL
+  explicit path.
+- uvicorn --reload must be launched from the folder CONTAINING the
+  "app" package (phase4/api/), never from inside app/ itself, or
+  Python can't resolve the "app.main:app" import string.
+- A helper run_server.bat (cd to script's own folder, then launch
+  uvicorn via the venv's python.exe) was created to make this reliable
+  going forward without re-diagnosing the same issue every session.

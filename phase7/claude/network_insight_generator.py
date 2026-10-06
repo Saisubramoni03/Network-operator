@@ -1,123 +1,296 @@
 """
 network_insight_generator.py — C1: Claude API — Network Insight Generator
 
-Pulls a curated grid evidence object from the warehouse (grid_features,
-network_anomaly_scores from ML4, network_risk_scores from ML6) and
-calls the Claude API to turn it into an operations-friendly
-explanation: SEVERITY, EVIDENCE, INTERPRETATION, INVESTIGATION STEPS.
+Builds a curated grid evidence object from the warehouse and sends it
+to Claude to generate an operations-friendly explanation.
 
-Hard rule enforced in the prompt: every number in EVIDENCE must appear
-in the input. If a field is missing, Claude must say so explicitly —
-never invent a value.
+Output:
+    SEVERITY
+    EVIDENCE
+    INTERPRETATION
+    NEXT CHECKS
+
+Hard rule:
+Every number mentioned under EVIDENCE must exist exactly in the
+input evidence object. Claude must never invent missing values.
 """
 
 import os
 import sqlite3
 import time
 import json
+
 from anthropic import Anthropic
+
+
+# ================================================================
+# CONFIGURATION
+# ================================================================
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DB_PATH = os.environ.get(
     "WAREHOUSE_DB_PATH",
-    os.path.join(os.path.dirname(__file__), "..", "..", "phase3", "warehouse", "network_warehouse.db")
+    os.path.abspath(
+        os.path.join(
+            BASE_DIR,
+            "..",
+            "..",
+            "phase3",
+            "warehouse",
+            "network_warehouse.db",
+        )
+    ),
 )
 
-client = Anthropic()  # reads ANTHROPIC_API_KEY from environment
+# Anthropic SDK automatically reads ANTHROPIC_API_KEY
+# from the environment.
+client = Anthropic()
 
-SYSTEM_PROMPT = """You are a network operations analyst assistant. You will be given a
-structured JSON evidence object describing a single grid cell's recent activity.
 
-Respond in exactly this structure, using these four headers verbatim:
+# Current model used for the main C1 test
+DEFAULT_MODEL = "claude-sonnet-5"
 
-SEVERITY: one word — low, medium, or high.
+
+# ================================================================
+# SYSTEM PROMPT
+# ================================================================
+
+SYSTEM_PROMPT = """
+You are a network operations analyst assistant.
+
+You will receive a structured JSON evidence object describing
+one network grid cell.
+
+Your job is to explain the evidence for a NOC engineer.
+
+Respond using EXACTLY these four headers:
+
+SEVERITY:
+One word only:
+low
+medium
+high
 
 EVIDENCE:
-List only the fields present in the input JSON, with their exact values. Do not
-calculate, round differently, or introduce any number that is not present in the
-input. If a field is null or missing, write "not available" for that field — do
-not guess or infer what it might be.
+List only values that are actually present in the input JSON.
+
+Rules:
+- Do not invent numbers.
+- Do not calculate new numbers.
+- Do not round numbers differently.
+- Do not estimate missing values.
+- Every numeric value must already appear in the input JSON.
+- If an expected field is missing, write:
+  "not available"
 
 INTERPRETATION:
-Your plain-language read of what the evidence suggests is happening. This is
-your judgment, not raw data — keep it clearly separate from EVIDENCE. If key
-fields are missing, explicitly state that your interpretation is limited by
-the missing data, and say which fields are missing.
+Explain in simple operational language what the evidence might
+suggest.
 
-INVESTIGATION STEPS:
-2-4 concrete next checks a NOC engineer should do, grounded in what's actually
-missing or anomalous — not generic advice.
+Important:
+- Clearly separate interpretation from raw evidence.
+- Do not present an inference as a fact.
+- If important fields are missing, explicitly say that the
+  interpretation is limited by the missing fields.
+- Do not claim network congestion because the evidence does not
+  contain capacity or utilization data.
 
-Critical rule: if the evidence object is missing fields needed to support a
-claim, say so explicitly in INTERPRETATION rather than filling the gap with
-an assumption. Never invent a number that isn't in the input."""
+NEXT CHECKS:
+Give 2-4 concrete checks that a NOC engineer should perform.
+
+The checks must be related to the actual evidence or missing
+evidence. Avoid generic advice.
+
+Critical rule:
+Never invent a number or missing field.
+"""
 
 
-# ------------------------------------------------------------------
-# Step 1: Build the curated evidence object from the warehouse
-# ------------------------------------------------------------------
+# ================================================================
+# DATABASE CONNECTION
+# ================================================================
+
 def get_connection():
+    """Open a connection to the network warehouse."""
+
     if not os.path.exists(DB_PATH):
-        raise FileNotFoundError(f"Warehouse database not found at {DB_PATH}")
+        raise FileNotFoundError(
+            f"Warehouse database not found at:\n{DB_PATH}"
+        )
+
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+
     return conn
 
 
-def build_grid_evidence(grid_id: int, drop_fields: list = None) -> dict:
-    """Assembles the curated grid evidence object: current activity,
-    baseline, growth, peak_ratio, variability, anomaly score — pulled
-    from the ML2 feature table, ML4's anomaly scores, and ML6's risk
-    scores. `drop_fields` lets you simulate missing evidence for the
-    insufficient-evidence test."""
-    drop_fields = drop_fields or []
+# ================================================================
+# BUILD CURATED EVIDENCE
+# ================================================================
+
+def build_grid_evidence(grid_id: int, drop_fields=None) -> dict:
+    """
+    Build the curated evidence object for one grid.
+
+    Data comes from:
+        grid_features
+        network_anomaly_scores
+        network_risk_scores
+
+    drop_fields can be used to test Claude's behaviour when
+    evidence is missing.
+    """
+
+    if drop_fields is None:
+        drop_fields = []
+
     conn = get_connection()
+
     try:
-        feature_row = conn.execute("""
-            SELECT feature_timestamp, avg_activity, activity_growth,
-                   active_hours, peak_ratio, variability, internet_share
+
+        # --------------------------------------------------------
+        # ML2 / Feature table
+        # --------------------------------------------------------
+
+        feature_row = conn.execute(
+            """
+            SELECT
+                feature_timestamp,
+                avg_activity,
+                activity_growth,
+                active_hours,
+                peak_ratio,
+                variability,
+                internet_share
             FROM grid_features
             WHERE grid_id = ?
             ORDER BY feature_timestamp DESC
             LIMIT 1
-        """, (grid_id,)).fetchone()
+            """,
+            (grid_id,),
+        ).fetchone()
 
-        anomaly_row = conn.execute("""
-            SELECT timestamp, current_activity, baseline_activity, anomaly_score, direction, reason
+        # --------------------------------------------------------
+        # ML4 / Anomaly table
+        # --------------------------------------------------------
+
+        anomaly_row = conn.execute(
+            """
+            SELECT
+                timestamp,
+                current_activity,
+                baseline_activity,
+                anomaly_score,
+                direction,
+                reason
             FROM network_anomaly_scores
             WHERE grid_id = ?
             ORDER BY timestamp DESC
             LIMIT 1
-        """, (grid_id,)).fetchone()
+            """,
+            (grid_id,),
+        ).fetchone()
 
-        risk_row = conn.execute("""
-            SELECT timestamp, risk_score, risk_level, model_version
+        # --------------------------------------------------------
+        # ML6 / Risk table
+        # --------------------------------------------------------
+
+        risk_row = conn.execute(
+            """
+            SELECT
+                timestamp,
+                risk_score,
+                risk_level,
+                model_version
             FROM network_risk_scores
             WHERE grid_id = ?
             ORDER BY timestamp DESC
             LIMIT 1
-        """, (grid_id,)).fetchone()
+            """,
+            (grid_id,),
+        ).fetchone()
+
     finally:
         conn.close()
 
-    evidence = {"grid_id": grid_id}
+    # ------------------------------------------------------------
+    # Start curated evidence object
+    # ------------------------------------------------------------
+
+    evidence = {
+        "grid_id": grid_id
+    }
+
+    # ------------------------------------------------------------
+    # Add feature evidence
+    # ------------------------------------------------------------
 
     if feature_row:
-        evidence["feature_timestamp"] = feature_row["feature_timestamp"]
-        evidence["avg_activity"] = feature_row["avg_activity"]
-        evidence["activity_growth"] = feature_row["activity_growth"]
-        evidence["peak_ratio"] = feature_row["peak_ratio"]
-        evidence["variability"] = feature_row["variability"]
+
+        evidence["feature_timestamp"] = feature_row[
+            "feature_timestamp"
+        ]
+
+        evidence["avg_activity"] = feature_row[
+            "avg_activity"
+        ]
+
+        evidence["activity_growth"] = feature_row[
+            "activity_growth"
+        ]
+
+        evidence["peak_ratio"] = feature_row[
+            "peak_ratio"
+        ]
+
+        evidence["variability"] = feature_row[
+            "variability"
+        ]
+
+    # ------------------------------------------------------------
+    # Add anomaly evidence
+    # ------------------------------------------------------------
 
     if anomaly_row:
-        evidence["current_activity"] = anomaly_row["current_activity"]
-        evidence["baseline_activity"] = anomaly_row["baseline_activity"]
-        evidence["anomaly_score"] = anomaly_row["anomaly_score"]
-        evidence["anomaly_direction"] = anomaly_row["direction"]
+
+        evidence["current_activity"] = anomaly_row[
+            "current_activity"
+        ]
+
+        evidence["baseline_activity"] = anomaly_row[
+            "baseline_activity"
+        ]
+
+        evidence["anomaly_score"] = anomaly_row[
+            "anomaly_score"
+        ]
+
+        evidence["anomaly_direction"] = anomaly_row[
+            "direction"
+        ]
+
+    # ------------------------------------------------------------
+    # Add risk evidence
+    # ------------------------------------------------------------
 
     if risk_row:
-        evidence["risk_score"] = risk_row["risk_score"]
-        evidence["risk_level"] = risk_row["risk_level"]
-        evidence["model_version"] = risk_row["model_version"]
+
+        evidence["risk_score"] = risk_row[
+            "risk_score"
+        ]
+
+        evidence["risk_level"] = risk_row[
+            "risk_level"
+        ]
+
+        evidence["model_version"] = risk_row[
+            "model_version"
+        ]
+
+    # ------------------------------------------------------------
+    # Remove fields for insufficient-evidence testing
+    # ------------------------------------------------------------
 
     for field in drop_fields:
         evidence.pop(field, None)
@@ -125,28 +298,72 @@ def build_grid_evidence(grid_id: int, drop_fields: list = None) -> dict:
     return evidence
 
 
-# ------------------------------------------------------------------
-# Step 2: Call the Claude API with the evidence object
-# ------------------------------------------------------------------
-def generate_insight(evidence: dict, model: str = "claude-sonnet-5") -> dict:
-    """Calls the Claude API with the evidence object. Returns the
-    response text plus latency and token usage, so callers can compare
-    models on cost/latency/reasoning depth (per the lab's activities)."""
+# ================================================================
+# CALL CLAUDE API
+# ================================================================
+
+def generate_insight(
+    evidence: dict,
+    model: str = DEFAULT_MODEL
+) -> dict:
+    """
+    Send curated evidence to Claude.
+
+    Returns:
+        model
+        text
+        latency
+        input tokens
+        output tokens
+    """
+
     user_message = (
-        "Here is the grid evidence object:\n\n"
-        f"{json.dumps(evidence, indent=2, default=str)}"
+        "Here is the curated grid evidence object.\n\n"
+        + json.dumps(
+            evidence,
+            indent=2,
+            default=str
+        )
     )
 
     start = time.time()
-    response = client.messages.create(
-        model=model,
-        max_tokens=600,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_message}],
-    )
+
+    try:
+
+        response = client.messages.create(
+            model=model,
+            max_tokens=1200,
+            system=SYSTEM_PROMPT,
+            messages=[
+                {
+                    "role": "user",
+                    "content": user_message
+                }
+            ],
+        )
+
+    except Exception as exc:
+
+        print("\nClaude API request failed.")
+        print(f"Model: {model}")
+        print(f"Error: {exc}")
+
+        raise
+
     elapsed = time.time() - start
 
-    text = "".join(block.text for block in response.content if block.type == "text")
+    # ------------------------------------------------------------
+    # Extract text response
+    # ------------------------------------------------------------
+
+    text_parts = []
+
+    for block in response.content:
+
+        if block.type == "text":
+            text_parts.append(block.text)
+
+    text = "\n".join(text_parts)
 
     return {
         "model": model,
@@ -157,76 +374,250 @@ def generate_insight(evidence: dict, model: str = "claude-sonnet-5") -> dict:
     }
 
 
-# ------------------------------------------------------------------
-# Step 3: Model comparison — cost, latency, reasoning depth
-# ------------------------------------------------------------------
-MODELS_TO_COMPARE = ["claude-haiku-4-5-20251001", "claude-sonnet-5", "claude-opus-5"]
+# ================================================================
+# MODEL COMPARISON
+# ================================================================
+
+MODELS_TO_COMPARE = [
+    "claude-haiku-4-5-20251001",
+    "claude-sonnet-5",
+    "claude-opus-5",
+]
 
 
 def compare_models(evidence: dict):
-    print(f"\n=== Model Comparison for grid {evidence.get('grid_id')} ===")
+    """
+    Compare Haiku, Sonnet and Opus using the same evidence.
+    """
+
+    print(
+        f"\n=== Model Comparison for grid "
+        f"{evidence.get('grid_id')} ==="
+    )
+
     results = []
+
     for model in MODELS_TO_COMPARE:
+
         print(f"\n--- {model} ---")
-        result = generate_insight(evidence, model=model)
-        print(f"Latency: {result['elapsed_seconds']}s | "
-              f"Input tokens: {result['input_tokens']} | Output tokens: {result['output_tokens']}")
-        print(result["text"])
+
+        result = generate_insight(
+            evidence,
+            model=model
+        )
+
+        print(
+            f"Latency: {result['elapsed_seconds']}s | "
+            f"Input tokens: {result['input_tokens']} | "
+            f"Output tokens: {result['output_tokens']}"
+        )
+
+        print("\n" + result["text"])
+
         results.append(result)
+
     return results
 
 
-# ------------------------------------------------------------------
-# Step 4: Short vs. rich context comparison
-# ------------------------------------------------------------------
-def compare_context_richness(grid_id: int, model: str = "claude-sonnet-5"):
-    print(f"\n=== Short vs. Rich Context Comparison for grid {grid_id} ===")
+# ================================================================
+# SHORT VS RICH CONTEXT
+# ================================================================
+
+def compare_context_richness(
+    grid_id: int,
+    model: str = DEFAULT_MODEL
+):
+    """
+    Compare Claude's response when it receives:
+
+    1. Only current activity
+    2. Full curated evidence
+    """
+
+    print(
+        f"\n=== Short vs Rich Context Comparison "
+        f"for grid {grid_id} ==="
+    )
 
     full_evidence = build_grid_evidence(grid_id)
+
+    # ------------------------------------------------------------
+    # Short context
+    # ------------------------------------------------------------
+
     short_evidence = {
         "grid_id": grid_id,
-        "current_activity": full_evidence.get("current_activity"),
+        "current_activity": full_evidence.get(
+            "current_activity"
+        ),
     }
 
-    print("\n--- SHORT context ---")
-    print(json.dumps(short_evidence, indent=2, default=str))
-    short_result = generate_insight(short_evidence, model=model)
-    print(short_result["text"])
+    print("\n--- SHORT CONTEXT ---")
 
-    print("\n--- RICH context (full evidence object) ---")
-    print(json.dumps(full_evidence, indent=2, default=str))
-    rich_result = generate_insight(full_evidence, model=model)
-    print(rich_result["text"])
+    print(
+        json.dumps(
+            short_evidence,
+            indent=2,
+            default=str
+        )
+    )
+
+    short_result = generate_insight(
+        short_evidence,
+        model=model
+    )
+
+    print("\n" + short_result["text"])
+
+    # ------------------------------------------------------------
+    # Rich context
+    # ------------------------------------------------------------
+
+    print("\n--- RICH CONTEXT ---")
+
+    print(
+        json.dumps(
+            full_evidence,
+            indent=2,
+            default=str
+        )
+    )
+
+    rich_result = generate_insight(
+        full_evidence,
+        model=model
+    )
+
+    print("\n" + rich_result["text"])
 
     return short_result, rich_result
 
 
-# ------------------------------------------------------------------
-# Step 5: Insufficient-evidence test — remove a field, confirm Claude
-# says so rather than filling the gap
-# ------------------------------------------------------------------
-def test_insufficient_evidence(grid_id: int, model: str = "claude-sonnet-5"):
-    print(f"\n=== Insufficient-Evidence Test for grid {grid_id} (risk_score removed) ===")
-    evidence = build_grid_evidence(grid_id, drop_fields=["risk_score", "risk_level", "model_version"])
-    print(json.dumps(evidence, indent=2, default=str))
-    result = generate_insight(evidence, model=model)
+# ================================================================
+# INSUFFICIENT EVIDENCE TEST
+# ================================================================
+
+def test_insufficient_evidence(
+    grid_id: int,
+    model: str = DEFAULT_MODEL
+):
+    """
+    Remove risk-related fields and verify that Claude does not
+    invent them.
+    """
+
+    print(
+        f"\n=== Insufficient-Evidence Test "
+        f"for grid {grid_id} ==="
+    )
+
+    evidence = build_grid_evidence(
+        grid_id,
+        drop_fields=[
+            "risk_score",
+            "risk_level",
+            "model_version",
+        ],
+    )
+
+    print("\nEvidence with risk fields removed:")
+
+    print(
+        json.dumps(
+            evidence,
+            indent=2,
+            default=str
+        )
+    )
+
+    result = generate_insight(
+        evidence,
+        model=model
+    )
+
+    print("\nClaude response:")
+
     print(result["text"])
+
     return result
 
 
+# ================================================================
+# MAIN
+# ================================================================
+
 if __name__ == "__main__":
-    TEST_GRID_ID = 4821  # change this to whichever grid you want to inspect
 
-    evidence = build_grid_evidence(TEST_GRID_ID)
-    print(f"=== Evidence object for grid {TEST_GRID_ID} ===")
-    print(json.dumps(evidence, indent=2, default=str))
+    TEST_GRID_ID = 4821
 
-    print("\n=== Standard Insight (claude-sonnet-5) ===")
-    result = generate_insight(evidence, model="claude-sonnet-5")
-    print(f"Latency: {result['elapsed_seconds']}s | Tokens in/out: "
-          f"{result['input_tokens']}/{result['output_tokens']}")
-    print(result["text"])
+    print("=" * 70)
+    print("C1 — CLAUDE API NETWORK INSIGHT GENERATOR")
+    print("=" * 70)
+
+    # ------------------------------------------------------------
+    # 1. Build evidence
+    # ------------------------------------------------------------
+
+    evidence = build_grid_evidence(
+        TEST_GRID_ID
+    )
+
+    print(
+        f"\n=== Evidence object for grid "
+        f"{TEST_GRID_ID} ==="
+    )
+
+    print(
+        json.dumps(
+            evidence,
+            indent=2,
+            default=str
+        )
+    )
+
+    # ------------------------------------------------------------
+    # 2. Standard Claude Sonnet test
+    # ------------------------------------------------------------
+
+    print(
+        "\n=== Standard Insight "
+        f"({DEFAULT_MODEL}) ==="
+    )
+
+    result = generate_insight(
+        evidence,
+        model=DEFAULT_MODEL
+    )
+
+    print(
+        f"Latency: {result['elapsed_seconds']}s | "
+        f"Tokens in/out: "
+        f"{result['input_tokens']}/"
+        f"{result['output_tokens']}"
+    )
+
+    print("\n" + result["text"])
+
+    # ------------------------------------------------------------
+    # 3. Model comparison
+    # ------------------------------------------------------------
 
     compare_models(evidence)
-    compare_context_richness(TEST_GRID_ID)
-    test_insufficient_evidence(TEST_GRID_ID)
+
+    # ------------------------------------------------------------
+    # 4. Short vs rich context
+    # ------------------------------------------------------------
+
+    compare_context_richness(
+        TEST_GRID_ID,
+        model=DEFAULT_MODEL
+    )
+
+    # ------------------------------------------------------------
+    # 5. Missing evidence test
+    # ------------------------------------------------------------
+
+    test_insufficient_evidence(
+        TEST_GRID_ID,
+        model=DEFAULT_MODEL
+    )

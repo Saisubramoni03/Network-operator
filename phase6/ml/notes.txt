@@ -1,0 +1,260 @@
+# Phase 6 — Machine Learning: Lightweight Network Activity Intelligence
+# Consolidated Notes: Workflow, Logic & Model Lifecycle
+
+
+## THE BIG PICTURE — WHY PHASE 6 EXISTS
+
+Phases 1-5 answer "what happened" (data) and "is this unusual, by a
+fixed rule" (NP3's rule-based alerts). Phase 6's job: add a genuine
+PREDICTIVE layer — a model that looks at a grid's recent trend and
+pattern shape, not just its current value, to flag "investigate this
+grid next hour" BEFORE the fixed-rule threshold necessarily fires.
+
+RULE THAT NEVER CHANGES ACROSS ALL 6 LABS: features describing time t
+must NEVER see data from t+1 or later. Every design decision in this
+phase traces back to this one boundary.
+
+
+## ML1 — FRAME THE OPERATIONAL ML PROBLEM (design-only, no code)
+
+THE CRITICAL TRAP, STATED FIRST: if a feature is computed over the SAME
+window the label describes, the model predicts a number from itself —
+looks like ~99% accuracy, is completely meaningless. Fix: features
+computed from the window ENDING AT t; label describes the window AT
+t+1 (the very next hour).
+
+Problem selected: HIGH-ACTIVITY RISK — "for grid G, at the hour
+immediately following t, is high activity likely?" (a genuine predictive
+extension of NP3's rule-based HIGH_ACTIVITY alert from Phase 1).
+
+Target label = PROXY, stated explicitly as such: label=1 if
+total_activity at t+1 exceeds the grid's OWN 90th-percentile historical
+activity — documented clearly as "a training proxy, not a claim about
+real congestion."
+
+Business action = an INSTRUCTION to a human ("investigate this grid"),
+never a CONCLUSION ("the network failed" / "there is congestion").
+
+NON-GOALS, listed explicitly: this project does NOT claim to predict
+congestion, capacity, throughput, latency, or packet loss — only
+grid-level communication ACTIVITY VOLUME exists in this dataset, never
+infrastructure health.
+
+THREE LEAKAGE RISKS IDENTIFIED UP FRONT (not discovered later):
+1. Same-window feature/label overlap (the core trap) -> fixed by t/t+1 boundary
+2. Threshold computed on future data -> fixed by computing it from
+   TRAINING PERIOD ONLY (enforced properly in ML3)
+3. Random train/test split -> fixed by CHRONOLOGICAL split, never shuffled
+
+
+## ML2 — ENGINEER NETWORK ACTIVITY FEATURES
+
+Six features, EVERY ONE using a strict trailing 24-hour window ending
+at t (never touching t+1):
+
+  avg_activity     = mean(total_activity) over trailing 24h
+  activity_growth  = (avg of last 24h / avg of the PRIOR 24h) - 1
+  active_hours     = count of hours with activity > 0, trailing 24h
+  peak_ratio       = max(total_activity) / avg(total_activity), trailing 24h
+  variability      = std/avg (coefficient of variation), trailing 24h
+  internet_share   = sum(internet_activity) / sum(total_activity), trailing 24h
+
+WHY 24 HOURS: matches NP3's "trailing day" concept from Phase 1; long
+enough to smooth single-hour noise, short enough to always be
+computable even with the project's ~10-14 days of accumulated history.
+
+DIVISION-BY-ZERO: every ratio-based feature explicitly guarded to
+return 0.0 for a zero-activity grid ("no activity, no signal" — not an
+error).
+
+REQUIRED LEAKAGE TEST (built and proven BOTH directions, not just
+asserted): a 24-hour low-activity series followed by ONE huge spike at
+t+1. The real implementation's feature row for t correctly does NOT
+reflect the spike (PASS). A DELIBERATELY BROKEN version (window
+extended by +1 hour) correctly DOES show contamination — proving the
+test itself is genuinely sensitive to leakage, not just passing by
+coincidence.
+
+PERFORMANCE BUG WE HIT: the first implementation looped row-by-row
+(~10,000 grids x ~170+ hours = 1M+ individual pandas .loc[] lookups) —
+froze completely. Same O(n) trap as NP3 in Phase 1. FIX: replaced the
+manual loop with pandas' built-in .rolling("24h") — vectorized,
+leakage-safe by construction (rolling only ever looks backward), and
+fast (seconds instead of freezing).
+
+PROOF: computed features for 10,000 grids / 1,679,994 rows. Hand-picked
+grid 4821's stored avg_activity/peak_ratio and independently
+recalculated both directly from raw hourly data — matched to 10+
+significant digits. Persisted into the grid_features table (built empty
+back in Phase 4/API4) — confirmed API4's endpoint immediately started
+returning REAL data with ZERO API code changes, proving the
+contract-first design from Phase 4 actually worked.
+
+
+## ML3 — TRAIN A SIMPLE RISK CLASSIFIER
+
+Chronological split (NEVER random): earliest ~70% of dates -> train,
+most recent ~30% -> test. Threshold for labels computed using ONLY
+training-period raw activity (leakage-safe), then applied as a fixed
+constant to label both train and test.
+
+Model: Logistic Regression (class_weight="balanced") — simplest
+interpretable baseline; coefficients directly readable as "which
+features push toward higher risk."
+
+REAL RESULTS (not hidden or rounded away):
+  Base rate — train: 0.103, test: 0.189
+  Balanced model:    accuracy 0.366, precision 0.193, recall 0.742
+  Unweighted model:  accuracy 0.811, precision 0.217, recall 0.001
+
+THE CORE LESSON OF THIS LAB, PROVEN WITH REAL NUMBERS: the unweighted
+model's 81% accuracy is WORSE than useless — it achieves that number by
+almost NEVER predicting "risk," catching only 0.1% of real events.
+Accuracy alone, without checking base rate + recall, actively hides
+this failure. This is why "is 85% enough?" has to be answered with
+"enough for WHAT" — not accepted at face value.
+
+Coefficients (directions made operational sense):
+  variability:     +1.50  (erratic grids more likely to spike again)
+  peak_ratio:      +0.32  (already-peaky grids somewhat more likely to spike)
+  internet_share:  -3.38  (internet-dominated grids are comparatively MORE stable)
+
+THREE REQUIRED WRITTEN OBSERVATIONS (one must name a limitation):
+1. Accuracy alone is misleading here (the base-rate trap, proven above)
+2. The model adds value specifically where NP3's FIXED rule can't
+   generalize — it uses TREND (activity_growth) and PATTERN SHAPE
+   (variability, peak_ratio), not just the current value
+3. LIMITATION: base rate nearly doubled from train (10.3%) to test
+   (18.9%) — the fixed, training-derived threshold may not hold as
+   overall activity grows across the week; a real production system
+   would need a threshold-drift strategy, an open question this lab
+   didn't need to solve but shouldn't be hidden.
+
+COMPARISON AGAINST NP3's RULE (regenerated directly, not the stale
+single-day CSV): out of ~510K test rows — both flag 59.4%, only-ML
+13.1%, only-NP3 11.1%, neither 16.4%. Picked one concrete disagreement
+(grid 5446, peak_ratio=1.29, just under NP3's 1.5 cutoff) and reasoned
+through it honestly: given the model's known low precision (19%), NP3's
+more conservative silence was judged MORE trustworthy in that specific
+borderline case — not a blind "the ML model wins" conclusion.
+
+BUG WE HIT: a stray try/except ImportError fallback in the script
+contained a broken hand-rolled logistic regression (referenced an
+undefined variable "discover") — traced back to sklearn simply not
+being installed in the ACTIVE venv (same "wrong Python resolves" issue
+from Phase 4/5). Fixed by installing scikit-learn explicitly into the
+correct venv and removing the fragile fallback entirely.
+
+
+## ML4 — ADD AN ANOMALY BASELINE (built in a separate session — changelog summary)
+
+New file: anomaly_baseline.py — GENERALIZES NP3's original
+leave-one-out-median function (Phase 1) to accept a parameterized
+bucket key instead of a hardcoded grid_id. Same logic, now callable
+with bucket_cols=["grid_id","hour"] — enabling a TRUE hour-of-day
+baseline across all 8 accumulated days (something NP3 explicitly
+COULDN'T do with only one day's data, per its own documented
+limitation statement back in Phase 1).
+
+Computes anomaly_score (signed % deviation from baseline) + direction
+(HIGH/LOW/NONE). Persists to a new table: network_anomaly_scores.
+
+Also regenerates NP3's alert logic DIRECTLY from the warehouse (instead
+of NP3's stale single-day CSV) — fixing a real alignment problem
+(NP3's original file only covered Nov 1, with on-the-hour timestamps
+that didn't match the warehouse's half-hour timestamps).
+
+Produces a genuine three-way comparison: regenerated-NP3 vs. ML3
+classifier vs. ML4 anomaly flags, across 8 days / 1.68M rows.
+
+Purely additive — no existing files changed.
+
+
+## ML5 — OPERATIONALIZE THE MODEL THROUGH FASTAPI (separate session)
+
+train_risk_model.py: added save_model_artifact() — persists the
+trained model + feature column order + version string + risk-level
+thresholds together into risk_model.joblib.
+
+New file: phase4/api/app/model_loader.py — load_model() loads and
+CACHES the artifact once; raises a clear FileNotFoundError at startup
+if missing (fails loudly immediately, never silently on first request).
+
+schemas.py: PredictRiskResponse gained feature_timestamp and
+top_features — ADDITIVE ONLY, nothing removed (this is exactly why RE5
+in React needed ZERO changes when this went live).
+
+service.py: predict_risk()'s entire body replaced — now loads the real
+artifact, reads the grid's latest feature row, validates no nulls,
+computes real predict_proba, buckets into risk_level via thresholds,
+computes top_features from coefficient x feature-value contributions.
+SAME function signature as the old stub — the contract from API5 held.
+
+main.py: added a startup hook (@app.on_event("startup")) that loads the
+model once when the server starts, not on first request.
+
+VERIFIED LIVE (re-confirmed independently in THIS session too, via
+React): grid 4821 -> risk_score=0.559, risk_level="medium",
+model_version="logreg-balanced-v1" (not "stub-v0") — proving both the
+API and the already-built RE5 frontend needed no changes to display
+real model output.
+
+
+## ML6 — BATCH SCORE ALL GRIDS (separate session)
+
+New file: batch_score.py — loads the ENTIRE grid_features table (every
+grid, every feature_timestamp, not just the latest), scores it all at
+once with model.predict_proba() (vectorized, not row-by-row — learned
+from ML2's performance mistake). Writes to a new table:
+network_risk_scores. Rebuilt fresh each run (same delete-then-reinsert
+pattern already used for grid_features).
+
+service.py updated AGAIN: get_hotspots()/get_alerts() (from Phase
+4/API3) had their hardcoded risk_score/risk_level/model_version=None
+replaced with a REAL lookup against network_risk_scores — verified live
+to now return real values instead of null.
+
+Airflow DAG (phase3/airflow/DE7_end_to_end_dag.py) updated: dependency
+chain changed from
+  ingest_validate_route >> spark_process >> load_warehouse >> quality_check >> notify
+to
+  ingest_validate_route >> spark_process >> load_warehouse >> generate_features >> score_risk >> quality_check >> notify
+Syntax-checked (py_compile passes) but NOT YET RUN LIVE — Airflow lives
+on the separate VM, so this is an explicitly documented open item, not
+silently assumed to work.
+
+
+## RECURRING THEMES ACROSS ALL OF PHASE 6
+
+1. The t/t+1 boundary is the single non-negotiable rule of this whole
+   phase — every feature, every threshold, every train/test split
+   decision traces back to "never let the model see the future."
+2. A leakage test isn't complete until it's proven to FAIL on a
+   deliberately broken implementation, not just PASS on the real one —
+   otherwise you don't know if it's a real test or just always green.
+3. Accuracy alone is not evidence of a good model — base rate,
+   precision, and recall must be reported together, and a very high
+   accuracy on an imbalanced problem is itself a red flag worth
+   investigating, not celebrating.
+4. A model should be compared against the simpler baseline it's meant
+   to improve on (NP3's fixed rule) — and disagreements between them
+   should be examined concretely, not hand-waved as "the model is
+   probably right."
+5. Contract-first API design (from Phase 4) pays off concretely here:
+   API4's endpoint and RE5's React page both worked correctly with real
+   ML output, with ZERO code changes, because the response shape was
+   designed to be additive-safe from the start.
+6. Vectorize before you loop — the same O(n) mistake (NP3 in Phase 1,
+   ML2's first draft here) is worth remembering as a pattern: pandas
+   row-by-row loops over large grid/time data will not scale, and
+   pandas' own built-in vectorized operations almost always exist as
+   the fix.
+
+
+## OPEN ITEMS CARRIED FORWARD INTO PHASE 7
+
+- Airflow DAG's new task ordering (generate_features -> score_risk
+  inserted before quality_check) is syntax-valid but UNCONFIRMED to run
+  correctly live — needs a real `airflow dags trigger` on the VM.
+- (From Phase 5) RE4's map-rendering slowness fix was written but not
+  yet independently reconfirmed as solved.

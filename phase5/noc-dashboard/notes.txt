@@ -1,0 +1,238 @@
+# Phase 5 — React: Lightweight NOC Dashboard
+# Consolidated Notes: Workflow, Logic & Component Structure
+
+
+## THE BIG PICTURE — WHY PHASE 5 EXISTS
+
+Phase 4 built 6 working API endpoints, but they only existed as JSON
+responses in Swagger. Phase 5's job: build ONLY enough React to make
+that data visible and clickable for a NOC operator — React stays a
+thin API CONSUMER, never a second engineering track, never computing
+anything the API doesn't already provide.
+
+RULE THAT NEVER CHANGES ACROSS ALL 5 LABS: every page fetches from the
+FastAPI backend (never hardcodes numbers, never talks to the warehouse
+directly) — with exactly ONE deliberate exception in RE4 (the static
+Milan GeoJSON, fetched once and cached, never re-fetched per API call).
+
+
+## OVERALL PAGE FLOW / APP STRUCTURE
+
+    App.js (BrowserRouter + nav)
+    │
+    ├── "/"          → NetworkOverview.js      (RE1, RE2)
+    ├── "/grid"      → GridExplorer.js         (RE3)
+    ├── "/hotspots"  → HotspotsAlerts.js       (RE4)
+    └── "/predict"   → PredictiveRisk.js       (RE5)
+
+    Shared building blocks used by multiple pages:
+    ├── api/client.js            <- apiGet() / apiPost(), reads .env
+    ├── components/MetricCard.js          <- reusable stat box
+    ├── components/ApiUnavailableBanner.js <- reusable red error banner
+    └── hooks/useMilanGrid.js + gridLookup.js  <- GeoJSON fetch+cache
+
+
+## PROJECT SETUP (RE1)
+
+    cd phase5
+    npx create-react-app noc-dashboard
+    cd noc-dashboard
+    npm install react-router-dom
+
+.env file (NEVER hardcode the API URL anywhere else):
+    REACT_APP_API_BASE_URL=http://127.0.0.1:8000
+
+CORS had to be added on the FASTAPI side (not React) so the browser
+would allow cross-origin requests from localhost:3000 to localhost:8000:
+    app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:3000"], ...)
+IMPORTANT ORDERING BUG WE HIT: this line must come AFTER
+"app = FastAPI(...)", never before — otherwise NameError: name 'app'
+is not defined, since the middleware needs an app object to attach to.
+
+
+## RUNNING BOTH SERVERS TOGETHER (the recurring operational pattern)
+
+Terminal 1 (FastAPI) — must run from phase4/api, NOT from inside
+phase4/api/app, and must use the venv's own python.exe explicitly
+(this machine's plain "python"/"uvicorn" commands kept resolving to
+the WRONG global Python even with the venv "active"):
+    cd phase4\api
+    phase4\api\venv\Scripts\python.exe -m uvicorn app.main:app --reload
+
+  A run_server.bat helper was created specifically to stop hitting this
+  same wrong-folder mistake over and over:
+      @echo off
+      cd /d "%~dp0"
+      "%~dp0venv\Scripts\python.exe" -m uvicorn app.main:app --reload
+
+Terminal 2 (React) — from phase5/noc-dashboard:
+    npm start
+
+
+## RE1 — SET UP THE NOC DASHBOARD
+
+Built api/client.js with apiGet()/apiPost() — both wrap fetch(), both
+throw a real Error with a readable message on any non-2xx response
+(reads the FastAPI error's "detail" field specifically).
+
+Built the FIRST page (NetworkOverview.js) with the three-state pattern
+every subsequent page reuses:
+    loading -> show "Loading..."
+    error   -> show a visible, readable error (never a blank screen)
+    data    -> show the real content
+
+PROOF REQUIRED AND DONE: stopped FastAPI, refreshed the page, confirmed
+a real visible error appeared (not a blank screen) — this is the single
+most important check in RE1, since a silently-blank dashboard is worse
+than a slow one.
+
+BUG WE HIT: an empty component file (Notepad created it, but content
+was never actually typed/saved before closing) produced React's
+"Element type is invalid... expected a string or class/function but
+got: object" error — NOT related to the API being down at all. Lesson:
+always verify a new file has real content with `type filename` before
+assuming a bug is something more complex.
+
+
+## RE2 — NETWORK OVERVIEW PAGE (turns RE1's raw page into real UI)
+
+Built two small reusable components:
+- MetricCard.js       — a labeled stat box (label + big value)
+- ApiUnavailableBanner.js — a STYLED red banner (not just red text)
+
+WORDING DISCIPLINE (same rule as API3, now enforced in the UI too):
+card labels say "Total Activity", "Active Grids", "Peak Hour", "Top
+Grid" — NEVER "megabytes", "message counts", or "congestion".
+
+CRITICAL DATE RULE: the reporting timestamp shown on screen comes from
+data.as_of (the API's own value) — NEVER new Date() / the browser
+clock. Since this project's data is from November 2013, if the page
+ever showed today's real date, that would be an immediate, obvious
+sign of a bug.
+
+PROOF: searched all .js files for "127.0.0.1" and "8000" outside of
+client.js/.env — zero matches, confirming no hardcoded URLs anywhere
+in a component.
+
+
+## RE3 — GRID EXPLORER
+
+Deliberate design decision made BEFORE coding (per the lab's own
+prompt): internet_activity routinely runs 10-50x higher than SMS/call
+activity (a fact known since Phase 1/NP1) — so a single shared-axis
+LINE CHART would squash SMS/calls into a flat line. Chose a TABLE
+instead, since each column gets its own visual space regardless of
+scale differences — sidesteps the readability trap entirely.
+
+Search form -> calls GET /network/grid/{grid_id} -> renders a table:
+Timestamp | SMS (in+out) | Calls (in+out) | Internet Activity | Total Activity
+
+PROOF: grid 4821 -> exactly 24 rows. grid 99999 -> clean "not found"
+message (via checking error.includes("not found")), not a crash. All
+four columns showed genuinely different values per row (proving no
+column was accidentally bound to the same field).
+
+
+## RE4 — HOTSPOTS, ALERTS AND THE MILAN MAP (the hardest React lab)
+
+DESIGN DECISION MADE BEFORE CODING (per the lab's explicit
+requirement): rendering all 10,000 GeoJSON polygons would freeze the
+page. Solution — fetch the full GeoJSON ONCE (cached), but only ever
+DRAW SVG polygons for the small subset of grids (~10-20) that the
+hotspots/alerts API responses actually flagged.
+
+THE CRITICAL TRAP (same lesson as SP4/DE6, now in the frontend): join
+map polygons to API grid_ids using properties.cellId — NEVER the
+top-level feature.id (0-indexed, would shift every cell by one,
+producing a map that LOOKS fine but silently highlights the wrong
+squares). Built a dedicated buildGridLookup() helper specifically to
+enforce this in one place.
+
+Severity styling distinguishes HIGH vs MEDIUM by MORE than color alone
+(different stroke width + text badge too) — accessibility-conscious,
+not relying purely on hue for colorblind users.
+
+REQUIRED CROSS-CHECK: took the top hotspot's grid_id, called
+/network/grid/{id}/location directly, and reasoned about whether the
+lat/lon should project to roughly where the highlighted square actually
+sits on the 600x600 SVG map (using the Milan bounding box: lon 9.0-9.3,
+lat 45.35-45.55) — this is the ONLY reliable way to catch an off-by-one
+join bug, since a wrong join still "looks like a working map."
+
+KNOWN OPEN ISSUE (explicitly deferred, not silently ignored): map
+rendering feels slow on every filter interaction, not just first load.
+Diagnosed as the GeoJSON re-fetching more than once despite the
+module-level cache — likely React StrictMode's dev-mode double-invoke
+interacting with the cache. A fix (module-level shared fetchPromise, so
+concurrent calls share one in-flight request instead of starting
+separate fetches) was written but NOT yet confirmed to have solved it —
+deliberately left as a follow-up rather than blocking the rest of the
+phase.
+
+
+## RE5 — PREDICTIVE RISK VIEW (final React lab)
+
+WORDING DISCIPLINE — THE MOST IMPORTANT PART OF THIS LAB: labels say
+"Attention Score" / "Attention Level", NEVER "Risk of Failure". An
+explicit sentence states outright: "This is a model-generated attention
+signal, not a confirmed network fault." Zero tolerance for implying the
+ML score is a diagnosis rather than a signal to look at.
+
+TWO VISUALLY DISTINCT BOXES (deliberate, not cosmetic):
+- Model Output   -> SOLID border  -> the hard number (score, level, version)
+- Narrative      -> DASHED border -> soft explanation text, with a
+                     disabled "Explain with AI (coming soon)" button
+                     living ONLY here — a placeholder for Phase 7's
+                     Claude explanation feature, never merged into the
+                     model's own box.
+
+Calls POST /network/predict-risk (the only POST-based page in this
+whole dashboard) via apiPost().
+
+FIRST TESTED AGAINST API5's STUB (risk_score=0.0, risk_level="unknown",
+model_version="stub-v0") — correctly rendered exactly as the contract
+promised. LATER (after ML5 was wired in a different session), RE-TESTED
+AGAINST THE REAL MODEL with zero code changes needed: model_version
+changed to "logreg-balanced-v1", real risk_score/risk_level values
+appeared — this is the actual payoff of API5's contract-first design
+from Phase 4: the UI never needed to change when the backend went from
+stub to real model.
+
+
+## RECURRING THEMES ACROSS ALL OF PHASE 5
+
+1. Three-state UI pattern (loading / error / data) on every single
+   page — a blank screen on failure is treated as a real bug, not an
+   acceptable edge case.
+2. Never trust the browser clock for "now" — always use the API's own
+   as_of / timestamp fields, since this is historical 2013 data.
+3. Wording discipline is enforced in the UI just as strictly as it was
+   in the API layer — "activity" not "messages/MB", "hotspot/alert" not
+   "congestion", "attention signal" not "confirmed fault".
+4. Cross-check geographic/joined data visually, not just by trusting
+   the API returned 200 — a wrong cellId/id join would still "work"
+   and still render a map, just with everything in the wrong place.
+5. Design the rendering/performance strategy BEFORE writing the
+   component (RE4's "only draw flagged polygons" decision) rather than
+   discovering a freeze after the fact.
+6. A well-designed API contract (additive-safe fields, stable field
+   names) means the frontend can be built against a STUB and require
+   zero changes when the real implementation (ML5) is swapped in later
+   — proven concretely in RE5, not just theoretical.
+
+
+## ENVIRONMENT / DEBUGGING NOTES (Phase 5 specific)
+
+- Same "wrong Python resolves" issue from Phase 4 continued into Phase
+  5 — always launch FastAPI via the explicit venv path or the
+  run_server.bat helper, always cd into phase4/api first (not
+  phase4/api/app).
+- An empty file saved via Notepad (content typed but window closed
+  without Ctrl+S, or dialog dismissed) produces confusing DOWNSTREAM
+  errors (e.g. React's "Element type is invalid") that look unrelated
+  to the real cause — always verify a newly created file's content
+  with `type filename` immediately after saving, especially after
+  we'd already been burned by this exact mistake once in Phase 1.
+- CORS must be configured on the FastAPI side, and the
+  app.add_middleware(...) call must come strictly AFTER
+  app = FastAPI(...) is defined, or the whole server fails to start.

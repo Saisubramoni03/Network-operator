@@ -1,16 +1,14 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { apiGet } from "../api/client";
-
+import { useSearchParams } from "react-router-dom";
 function GridExplorer() {
   const [gridIdInput, setGridIdInput] = useState("");
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(false);
   const [searchedGridId, setSearchedGridId] = useState(null);
-
-  const handleSearch = (e) => {
-    e.preventDefault();
-    const gridId = parseInt(gridIdInput, 10);
+  const [searchParams] = useSearchParams();
+    const searchGrid = (gridId) => {
     if (isNaN(gridId)) {
       setError("Please enter a valid numeric grid ID.");
       setData(null);
@@ -27,6 +25,22 @@ function GridExplorer() {
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false));
   };
+
+  const handleSearch = (e) => {
+    e.preventDefault();
+    searchGrid(parseInt(gridIdInput, 10));
+  };
+
+  // Auto-search when arriving via ?grid_id=... (e.g. clicked from the
+  // Hotspots & Alerts map or table)
+  useEffect(() => {
+    const gridIdFromUrl = searchParams.get("grid_id");
+    if (gridIdFromUrl) {
+      setGridIdInput(gridIdFromUrl);
+      searchGrid(parseInt(gridIdFromUrl, 10));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
 
   return (
     <div>
